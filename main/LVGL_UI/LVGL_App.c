@@ -882,11 +882,6 @@ static void map_locate_btn_cb(lv_event_t *event)
     map_refresh_grid();
     map_gps_marker_update();
     scale_bar_update();
-    if (s_map_locate_status_lbl != NULL) {
-        lv_label_set_text(s_map_locate_status_lbl, "Centered / 200 m");
-        lv_obj_set_style_text_color(s_map_locate_status_lbl,
-                                    lv_color_hex(0x1565C0), 0);
-    }
     ESP_LOGI(TAG, "GPS centered: WGS84 %.6f, %.6f", gps.latitude, gps.longitude);
 }
 
@@ -927,20 +922,21 @@ static void gps_ui_timer_cb(lv_timer_t *timer)
 
     if (s_map_device_info_lbl != NULL) {
         if (available && gps.valid) {
-            const float speed = gps.speed_kmh < 0.5f ? 0.0f : gps.speed_kmh;
+            const float speed = !isfinite(gps.speed_kmh) || gps.speed_kmh < 0.5f
+                                    ? 0.0f : gps.speed_kmh;
             const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
             const uint32_t age_s = gps.last_fix_ms > 0 ?
                                    (now_ms - gps.last_fix_ms) / 1000 : 0;
             lv_label_set_text_fmt(s_map_device_info_lbl,
-                                  "Satellites: %u\nSpeed: %.1f km/h\nLast fix: %lu s ago",
+                                  "satellites: %u\nspeed: %.1f km/h\nlast fix: %lus ago",
                                   gps.satellites, speed, (unsigned long)age_s);
         } else if (available && gps.receiving) {
             lv_label_set_text_fmt(s_map_device_info_lbl,
-                                  "Satellites: %u\nSpeed: --\nLast fix: searching",
+                                  "satellites: %u\nspeed: 0.0 km/h\nlast fix: searching",
                                   gps.satellites);
         } else {
             lv_label_set_text(s_map_device_info_lbl,
-                              "Satellites: --\nSpeed: --\nLast fix: --");
+                              "satellites: --\nspeed: 0.0 km/h\nlast fix: --");
         }
     }
 
@@ -1517,11 +1513,12 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_set_style_bg_opa(s_settings_home, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(s_settings_home, 0, 0);
     lv_obj_set_style_pad_all(s_settings_home, 0, 0);
-    lv_obj_add_flag(s_settings_home, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM);
-    lv_obj_remove_flag(s_settings_home, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_CHAIN);
-    lv_obj_set_scroll_dir(s_settings_home, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(s_settings_home, LV_SCROLLBAR_MODE_AUTO);
-    lv_obj_set_flex_flow(s_settings_home, LV_FLEX_FLOW_COLUMN);
+    /* Keep the page fixed and let only the list own vertical scrolling. */
+    lv_obj_remove_flag(s_settings_home, LV_OBJ_FLAG_SCROLLABLE |
+                       LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_ELASTIC |
+                       LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_set_scroll_dir(s_settings_home, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(s_settings_home, LV_SCROLLBAR_MODE_OFF);
 
     lv_obj_t *heading = lv_label_create(s_settings_home);
     lv_label_set_text(heading, "Settings");
@@ -1542,11 +1539,13 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_set_style_border_color(list, lv_color_hex(0xDDE3EA), 0);
     lv_obj_set_style_radius(list, 7, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
-    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(list, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
 
-    settings_value_row(list, "Device Name", "Navigator", true);
+    settings_value_row(list, "Device Name", "TinyTab", true);
     settings_value_row(list, "WiFi", "Manage", true);
     settings_value_row(list, "Time", "1970-01-01", true);
     settings_value_row(list, "LoRa", "MeshCore", true);
@@ -1781,7 +1780,7 @@ static void map_gps_ui_create(lv_obj_t *parent)
                             LV_EVENT_CLICKED, NULL);
 
         s_map_device_name_lbl = lv_label_create(s_map_device_bubble);
-        lv_label_set_text(s_map_device_name_lbl, "Navigator");
+        lv_label_set_text(s_map_device_name_lbl, "TinyTab");
         lv_obj_set_pos(s_map_device_name_lbl, 12, 10);
         lv_obj_set_style_text_font(s_map_device_name_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(s_map_device_name_lbl, lv_color_hex(0x123B65), 0);
@@ -1791,7 +1790,7 @@ static void map_gps_ui_create(lv_obj_t *parent)
         lv_obj_set_style_text_color(s_map_device_expand_lbl, lv_color_hex(0x1769AA), 0);
         s_map_device_info_lbl = lv_label_create(s_map_device_bubble);
         lv_label_set_text(s_map_device_info_lbl,
-                          "Satellites: --\nSpeed: --\nLast fix: --");
+                          "satellites: --\nspeed: 0.0 km/h\nlast fix: --");
         lv_obj_set_pos(s_map_device_info_lbl, 14, 43);
         lv_obj_set_style_text_font(s_map_device_info_lbl, &lv_font_montserrat_12, 0);
         lv_obj_set_style_text_line_space(s_map_device_info_lbl, 5, 0);
@@ -1818,12 +1817,6 @@ static void map_gps_ui_create(lv_obj_t *parent)
     lv_obj_set_style_text_color(locate_icon, lv_color_white(), 0);
     lv_obj_center(locate_icon);
 
-    s_map_locate_status_lbl = lv_label_create(parent);
-    lv_label_set_text(s_map_locate_status_lbl, "");
-    lv_obj_set_pos(s_map_locate_status_lbl, MAP_W - 190, 220);
-    lv_obj_set_width(s_map_locate_status_lbl, 180);
-    lv_obj_set_style_text_align(s_map_locate_status_lbl, LV_TEXT_ALIGN_RIGHT, 0);
-    lv_obj_set_style_text_font(s_map_locate_status_lbl, &lv_font_montserrat_10, 0);
 }
 
 static void map_create(lv_obj_t *parent)
