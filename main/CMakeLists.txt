@@ -1,0 +1,25 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "GPS/GPS.c"
+        "LCD_Driver/Display_Driver.c"
+        "LVGL_UI/LVGL_App.c"
+        "SD_Card/SD_MMC.c"
+    INCLUDE_DIRS
+        "."
+        "LCD_Driver"
+        "GPS"
+        "LVGL_UI"
+        "SD_Card"
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_uart
+        esp_driver_sdmmc
+        esp_driver_sdspi
+        esp_driver_spi
+        esp_timer
+        spi_flash
+        fatfs
+        waveshare__esp32_p4_wifi6_touch_lcd_7b
+        lvgl__lvgl
+)

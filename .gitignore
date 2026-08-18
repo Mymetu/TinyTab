@@ -1,0 +1,21 @@
+# ESP-IDF and build outputs
+build/
+managed_components/
+components/lvgl__lvgl/
+sdkconfig.old
+
+# Vendor reference material (do not publish)
+ESP32-P4-WIFI6-Touch-LCD-7B-main/
+
+# Local editor and OS files
+.vscode/*.user.json
+.vs/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Generated firmware images
+*.bin
+*.elf
+*.map

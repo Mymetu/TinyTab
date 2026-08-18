@@ -1,0 +1,19 @@
+{
+  "idf.currentSetup": "C:\\esp\\v6.0.2\\esp-idf",
+  "idf.flashType": "UART",
+  "idf.portWin": "COM383",
+  "idf.openOcdConfigs": [
+    "board/esp32p4-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "IDF_TARGET": "esp32p4"
+  },
+  "idf.buildPath": "${workspaceFolder}\\build",
+  "idf.buildPathWin": "${workspaceFolder}\\build",
+  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-20.1.1_20250829\\esp-clang\\bin\\clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=**",
+    "--compile-commands-dir=e:\\IDF-Code\\LCD-7.0-TEST-Map\\build"
+  ]
+}
