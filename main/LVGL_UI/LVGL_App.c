@@ -925,11 +925,20 @@ static void gps_ui_timer_cb(lv_timer_t *timer)
             const float speed = !isfinite(gps.speed_kmh) || gps.speed_kmh < 0.5f
                                     ? 0.0f : gps.speed_kmh;
             const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-            const uint32_t age_s = gps.last_fix_ms > 0 ?
-                                   (now_ms - gps.last_fix_ms) / 1000 : 0;
-            lv_label_set_text_fmt(s_map_device_info_lbl,
-                                  "satellites: %u\nspeed: %.1f km/h\nlast fix: %lus ago",
-                                  gps.satellites, speed, (unsigned long)age_s);
+            char last_fix_text[24];
+            char info_text[96];
+            if (gps.last_fix_ms > 0) {
+                const uint32_t age_s = (now_ms - gps.last_fix_ms) / 1000;
+                snprintf(last_fix_text, sizeof(last_fix_text), "%lu s ago",
+                         (unsigned long)age_s);
+            } else {
+                snprintf(last_fix_text, sizeof(last_fix_text), "--");
+            }
+            /* Format floats with libc first; LVGL's formatter may have float support disabled. */
+            snprintf(info_text, sizeof(info_text),
+                     "satellites: %u\nspeed: %.1f km/h\nlast fix: %s",
+                     gps.satellites, speed, last_fix_text);
+            lv_label_set_text(s_map_device_info_lbl, info_text);
         } else if (available && gps.receiving) {
             lv_label_set_text_fmt(s_map_device_info_lbl,
                                   "satellites: %u\nspeed: 0.0 km/h\nlast fix: searching",
@@ -1451,6 +1460,8 @@ static void settings_row_style(lv_obj_t *row)
 {
     lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
                        LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
+    /* Let vertical drags that start on a label or row bubble to the settings list. */
+    lv_obj_add_flag(row, LV_OBJ_FLAG_SCROLL_CHAIN_VER | LV_OBJ_FLAG_GESTURE_BUBBLE);
     lv_obj_set_width(row, LV_PCT(100));
     lv_obj_set_height(row, 52);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
@@ -1498,6 +1509,7 @@ static void settings_switch_row(lv_obj_t *list, const char *name, bool enabled)
     lv_obj_set_flex_grow(label, 1);
     lv_obj_t *sw = lv_switch_create(row);
     lv_obj_set_size(sw, 50, 28);
+    lv_obj_add_flag(sw, LV_OBJ_FLAG_SCROLL_CHAIN_VER | LV_OBJ_FLAG_GESTURE_BUBBLE);
     if (enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
 }
 
@@ -1539,7 +1551,7 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_set_style_border_color(list, lv_color_hex(0xDDE3EA), 0);
     lv_obj_set_style_radius(list, 7, 0);
     lv_obj_set_style_pad_all(list, 0, 0);
-    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_flag(list, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM);
     lv_obj_remove_flag(list, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_CHAIN);
     lv_obj_set_scroll_dir(list, LV_DIR_VER);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
