@@ -36,12 +36,16 @@
 #define TILE_SIZE       256
 #define MAP_W           (EXAMPLE_LCD_H_RES - SIDE_MENU_W)
 #define MAP_H           (EXAMPLE_LCD_V_RES - STATUS_H)
-#define GRID_COLS       5
-#define GRID_ROWS       4
-#define TILE_COUNT      25
+#define GRID_COLS       6
+#define GRID_ROWS       5
+#define GRID_COUNT      (GRID_COLS * GRID_ROWS)
+/* A fractional tile offset can expose 5x4 tiles on the 876x564 map viewport.
+ * Keep one extra column and row so the moving layer always covers the right
+ * and bottom edges. The decoded cache remains larger than two full grids. */
+#define TILE_COUNT      80
 #define PREFETCH_DEPTH  1
 #define TILE_BYTES      (TILE_SIZE * TILE_SIZE * 2)
-#define LOAD_QUEUE_LEN  TILE_COUNT
+#define LOAD_QUEUE_LEN  32
 #define RESULT_QUEUE_LEN (LOAD_QUEUE_LEN * 2)
 #define MAP_RESULT_FRAME_MS 16
 #define RAW_MAP_ROOT    "/sdcard"
@@ -56,7 +60,6 @@ typedef struct {
 } raw_map_info_t;
 
 typedef struct {
-    lv_obj_t *image;
     lv_image_dsc_t dsc;
     uint8_t *pixels;
     int z;
@@ -66,7 +69,15 @@ typedef struct {
     bool valid;
     bool loading;
     bool failed;
+    uint32_t last_use;
 } map_tile_t;
+
+typedef struct {
+    lv_obj_t *image;
+    int z;
+    int x;
+    int y;
+} map_cell_t;
 
 typedef struct {
     lv_obj_t *obj;
@@ -101,8 +112,13 @@ static lv_timer_t *s_map_timer;
 static QueueHandle_t s_load_queue;
 static QueueHandle_t s_result_queue;
 static map_tile_t s_tiles[TILE_COUNT];
+static map_cell_t s_cells[GRID_COUNT];
+static uint16_t s_tile_capacity;
+static uint32_t s_tile_use_clock;
 static volatile uint32_t s_map_generation = 1;
 static uint32_t s_result_drop_logs;
+static uint32_t s_raw_tile_logs;
+static uint32_t s_png_fallback_logs;
 static lv_obj_t *s_raw_image;
 static lv_image_dsc_t s_raw_dsc;
 static uint8_t *s_raw_pixels;
@@ -116,6 +132,7 @@ static bool s_raw_mode;
 static int s_levels[32];
 static int s_level_count;
 static int s_zoom = -1;
+static bool s_raw_tile_tree;
 static double s_world_x;
 static double s_world_y;
 static int s_grid_x0;
@@ -241,8 +258,10 @@ static uint16_t rgb565(const uint8_t *p)
     return (uint16_t)(((p[0] >> 3) << 11) | ((p[1] >> 2) << 5) | (p[2] >> 3));
 }
 
-static bool decode_tile(const char *path, uint8_t *out)
+static bool read_tile_png(const char *path, uint8_t **png_out, size_t *size_out)
 {
+    *png_out = NULL;
+    *size_out = 0;
     FILE *file = fopen(path, "rb");
     if (file == NULL) return false;
     if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return false; }
@@ -256,26 +275,56 @@ static bool decode_tile(const char *path, uint8_t *out)
         return false;
     }
     fclose(file);
+    *png_out = png;
+    *size_out = (size_t)length;
+    return true;
+}
 
+/* Raw tiles are little-endian RGB565, exactly the format consumed by LVGL.
+ * Reading them directly avoids the several-hundred-millisecond PNG inflate
+ * and RGB conversion path on the ESP32-P4. */
+static bool read_tile_rgb565(const char *path, uint8_t *out)
+{
+    FILE *file = fopen(path, "rb");
+    if (file == NULL) return false;
+    size_t got = fread(out, 1, TILE_BYTES, file);
+    int extra = fgetc(file);
+    fclose(file);
+    return got == TILE_BYTES && extra == EOF;
+}
+
+static bool decode_tile_png(uint8_t *png, size_t png_size, uint8_t *out)
+{
     unsigned width = 0, height = 0;
     lv_draw_buf_t *decoded = NULL;
-    unsigned error = lodepng_decode32((unsigned char **)&decoded, &width, &height,
-                                      png, (size_t)length);
-    heap_caps_free(png);
+    /* Offline tiles are opaque 8-bit palette PNGs. Expanding straight to RGB
+     * avoids producing and then discarding a fourth alpha byte per pixel. */
+    unsigned error = lodepng_decode24((unsigned char **)&decoded, &width, &height,
+                                      png, png_size);
     if (error != 0 || decoded == NULL || decoded->data == NULL ||
         width == 0 || height == 0 || width > TILE_SIZE || height > TILE_SIZE) {
         if (decoded != NULL) lv_draw_buf_destroy(decoded);
         return false;
     }
 
-    memset(out, 0, TILE_BYTES);
-    const uint8_t *rgba = decoded->data;
-    for (unsigned y = 0; y < height; y++) {
-        for (unsigned x = 0; x < width; x++) {
-            uint16_t value = rgb565(&rgba[((size_t)y * width + x) * 4]);
-            size_t offset = ((size_t)y * TILE_SIZE + x) * 2;
+    const uint8_t *rgb = decoded->data;
+    if (width == TILE_SIZE && height == TILE_SIZE) {
+        const size_t pixels = (size_t)width * height;
+        for (size_t i = 0; i < pixels; i++) {
+            uint16_t value = rgb565(&rgb[i * 3]);
+            size_t offset = i * 2;
             out[offset] = (uint8_t)value;
             out[offset + 1] = (uint8_t)(value >> 8);
+        }
+    } else {
+        memset(out, 0, TILE_BYTES);
+        for (unsigned y = 0; y < height; y++) {
+            for (unsigned x = 0; x < width; x++) {
+                uint16_t value = rgb565(&rgb[((size_t)y * width + x) * 3]);
+                size_t offset = ((size_t)y * TILE_SIZE + x) * 2;
+                out[offset] = (uint8_t)value;
+                out[offset + 1] = (uint8_t)(value >> 8);
+            }
         }
     }
     lv_draw_buf_destroy(decoded);
@@ -287,7 +336,7 @@ static bool tile_key_equal(const map_tile_t *tile, int z, int x, int y)
     return tile->z == z && tile->x == x && tile->y == y;
 }
 
-static void map_tile_set_source(map_tile_t *tile)
+static void map_tile_prepare_source(map_tile_t *tile)
 {
     tile->dsc.header.cf = LV_COLOR_FORMAT_RGB565;
     tile->dsc.header.w = TILE_SIZE;
@@ -295,7 +344,6 @@ static void map_tile_set_source(map_tile_t *tile)
     tile->dsc.header.stride = TILE_SIZE * 2;
     tile->dsc.data = tile->pixels;
     tile->dsc.data_size = TILE_BYTES;
-    lv_image_set_src(tile->image, &tile->dsc);
 }
 
 static void map_loader_release_dropped(const tile_request_t *request)
@@ -310,46 +358,113 @@ static void map_loader_release_dropped(const tile_request_t *request)
     s_refresh_pending = true;
 }
 
+static void map_loader_send_result(const tile_request_t *request, bool ok)
+{
+    tile_result_t result = {
+        .slot = request->slot,
+        .token = request->token,
+        .generation = request->generation,
+        .ok = ok,
+    };
+    if (xQueueSend(s_result_queue, &result, pdMS_TO_TICKS(20)) != pdTRUE) {
+        map_loader_release_dropped(request);
+        if (s_result_drop_logs++ < 4) {
+            ESP_LOGW(TAG, "tile result queue full; keeping loader responsive");
+        }
+    }
+}
+
 static void map_loader_task(void *arg)
 {
     (void)arg;
     tile_request_t request;
     uint32_t failure_logs = 0;
+    uint32_t completed = 0;
+    uint64_t read_total = 0;
+    uint64_t decode_total = 0;
     for (;;) {
         if (xQueueReceive(s_load_queue, &request, portMAX_DELAY) != pdTRUE) continue;
-        /* A zoom or a fast pan can invalidate queued work. Drop it before
-         * touching the tile buffer so an old decode can never race a new one. */
         if (request.generation != s_map_generation) {
-            tile_result_t stale = {.slot = request.slot, .token = request.token,
-                                    .generation = request.generation, .ok = false};
-            if (xQueueSend(s_result_queue, &stale, pdMS_TO_TICKS(20)) != pdTRUE) {
-                map_loader_release_dropped(&request);
-                if (s_result_drop_logs++ < 4) {
-                ESP_LOGW(TAG, "tile result queue full while dropping stale work");
-                }
-            }
+            map_loader_send_result(&request, false);
             continue;
         }
         char path[192];
+        char raw_path[192];
+        map_tile_t *tile = request.slot < TILE_COUNT ? &s_tiles[request.slot] : NULL;
+        if (tile == NULL) {
+            map_loader_send_result(&request, false);
+            continue;
+        }
+        int64_t started = esp_timer_get_time();
+        uint32_t read_us = 0;
+        uint32_t decode_us = 0;
+        bool raw_rgb565 = false;
+        bool ok = false;
+        /* The converter emits .rgb565; accept .bin as well for files made by
+         * the earlier map tooling. Prefer raw data before opening PNG. */
+        if (s_raw_tile_tree) {
+            snprintf(raw_path, sizeof(raw_path), "%s/%d/%d/%d.rgb565", s_map_root,
+                     request.z, request.x, request.y);
+            if (read_tile_rgb565(raw_path, tile->pixels)) {
+                raw_rgb565 = true;
+                ok = true;
+            } else {
+                snprintf(raw_path, sizeof(raw_path), "%s/%d/%d/%d.bin", s_map_root,
+                         request.z, request.x, request.y);
+                if (read_tile_rgb565(raw_path, tile->pixels)) {
+                    raw_rgb565 = true;
+                    ok = true;
+                }
+            }
+        }
+        read_us = (uint32_t)(esp_timer_get_time() - started);
         snprintf(path, sizeof(path), "%s/%d/%d/%d.png", s_map_root,
                  request.z, request.x, request.y);
-        bool ok = decode_tile(path, s_tiles[request.slot].pixels);
+        if (!ok) {
+            uint8_t *png = NULL;
+            size_t png_size = 0;
+            int64_t decode_started = esp_timer_get_time();
+            ok = read_tile_png(path, &png, &png_size);
+            read_us = (uint32_t)(decode_started - started);
+            if (ok) {
+                /* Keep the original MUI/backup topology: one worker reads and
+                 * decodes a tile, so no second task or decode queue can delay
+                 * the next visible tile. */
+                ok = decode_tile_png(png, png_size, tile->pixels);
+                decode_us = (uint32_t)(esp_timer_get_time() - decode_started);
+            }
+            if (png != NULL) heap_caps_free(png);
+        }
+        if (raw_rgb565) {
+            if (s_raw_tile_logs++ < 3) {
+                ESP_LOGI(TAG, "raw RGB565 tile ready: %d/%d/%d read=%lu us",
+                         request.z, request.x, request.y,
+                         (unsigned long)read_us);
+            }
+        } else if (s_png_fallback_logs++ < 1) {
+            ESP_LOGI(TAG, "PNG tile path active (no raw RGB565 tree): %d/%d/%d",
+                     request.z, request.x, request.y);
+        }
         if (!ok && failure_logs < 12) {
             ESP_LOGW(TAG, "tile load failed: %s", path);
             failure_logs++;
         }
-        tile_result_t result = {
-            .slot = request.slot,
-            .token = request.token,
-            .generation = request.generation,
-            .ok = ok,
-        };
-        if (xQueueSend(s_result_queue, &result, pdMS_TO_TICKS(20)) != pdTRUE) {
-            map_loader_release_dropped(&request);
-            if (s_result_drop_logs++ < 4) {
-                ESP_LOGW(TAG, "tile result queue full; keeping loader responsive");
+        map_loader_send_result(&request, ok);
+        if (ok && tile->loading && tile->token == request.token &&
+            request.generation == s_map_generation) {
+            completed++;
+            read_total += read_us;
+            decode_total += decode_us;
+            if ((completed & 15U) == 0) {
+                ESP_LOGI(TAG, "tile pipeline avg: read=%lu us decode=%lu us (%lu tiles)",
+                         (unsigned long)(read_total / completed),
+                         (unsigned long)(decode_total / completed),
+                         (unsigned long)completed);
             }
         }
+        /* Give IDLE1 and the MeshCore task a scheduling point between tiles.
+         * This does not affect LVGL, which remains on CPU0. */
+        vTaskDelay(1);
     }
 }
 
@@ -361,14 +476,13 @@ static void map_loader_start(void)
         ESP_LOGE(TAG, "tile queues unavailable");
         return;
     }
-    if (xTaskCreatePinnedToCoreWithCaps(map_loader_task, "map_png", 12288, NULL, 4,
-                                        NULL, 1,
-                                        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT) != pdPASS) {
-        ESP_LOGE(TAG, "tile worker unavailable");
-        vQueueDelete(s_load_queue);
-        vQueueDelete(s_result_queue);
-        s_load_queue = NULL;
-        s_result_queue = NULL;
+    BaseType_t loader_ok = xTaskCreatePinnedToCoreWithCaps(
+        map_loader_task, "map_tile", 12288, NULL, 4, NULL, 1,
+        MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (loader_ok != pdPASS) {
+        ESP_LOGE(TAG, "tile pipeline tasks unavailable");
+    } else {
+        ESP_LOGI(TAG, "tile pipeline ready: one async SD/PNG worker on core 1");
     }
 }
 
@@ -422,7 +536,12 @@ static bool find_level_center(int z, double *center_x, double *center_y)
     while ((entry = readdir(ydir)) != NULL) {
         char *end = NULL;
         long y = strtol(entry->d_name, &end, 10);
-        if (end != entry->d_name && (*end == '\0' || strcmp(end, ".png") == 0)) {
+        if (end != entry->d_name &&
+            (*end == '\0' || strcmp(end, ".png") == 0 ||
+             strcmp(end, ".rgb565") == 0 || strcmp(end, ".bin") == 0)) {
+            if (strcmp(end, ".rgb565") == 0 || strcmp(end, ".bin") == 0) {
+                s_raw_tile_tree = true;
+            }
             if (y < min_y) min_y = (int)y;
             if (y > max_y) max_y = (int)y;
         }
@@ -647,15 +766,15 @@ static void gps_wgs84_to_gcj02(double wgs_latitude, double wgs_longitude,
 static void queue_tile(int slot, int x, int y)
 {
     map_tile_t *tile = &s_tiles[slot];
-    if (s_load_queue == NULL || tile->loading) return;
+    if (s_load_queue == NULL || tile->pixels == NULL || tile->loading) return;
     tile->z = s_zoom;
     tile->x = x;
     tile->y = y;
     tile->valid = false;
     tile->failed = false;
     tile->loading = true;
+    tile->last_use = ++s_tile_use_clock;
     tile->token++;
-    lv_obj_add_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
     tile_request_t request = {.slot = (uint8_t)slot, .token = tile->token,
                               .generation = s_map_generation,
                               .z = tile->z, .x = tile->x, .y = tile->y};
@@ -677,7 +796,10 @@ static int tile_find(int z, int x, int y)
     for (int i = 0; i < TILE_COUNT; i++) {
         map_tile_t *tile = &s_tiles[i];
         if ((tile->valid || tile->loading || tile->failed) &&
-            tile_key_equal(tile, z, x, y)) return i;
+            tile_key_equal(tile, z, x, y)) {
+            tile->last_use = ++s_tile_use_clock;
+            return i;
+        }
     }
     return -1;
 }
@@ -685,10 +807,15 @@ static int tile_find(int z, int x, int y)
 static int tile_evict_slot(void)
 {
     int fallback = -1;
+    uint32_t oldest = UINT32_MAX;
     for (int i = 0; i < TILE_COUNT; i++) {
         map_tile_t *tile = &s_tiles[i];
+        if (tile->pixels == NULL) continue;
         if (!tile->loading && !tile->valid && !tile->failed) return i;
-        if (!tile->loading && !tile_in_grid(tile)) fallback = i;
+        if (!tile->loading && !tile_in_grid(tile) && tile->last_use <= oldest) {
+            oldest = tile->last_use;
+            fallback = i;
+        }
     }
     return fallback;
 }
@@ -708,19 +835,77 @@ static void request_tile_key(int z, int x, int y)
     queue_tile(slot, x, y);
 }
 
+static void map_prefetch_margin(void)
+{
+    if (s_load_queue == NULL || s_zoom < 0) return;
+
+    /* Load the strip in the direction of travel first. The queue is FIFO, so
+     * these tiles are ready before the less urgent side of the ring. */
+    if (s_pan_dir_x != 0) {
+        for (int depth = 1; depth <= PREFETCH_DEPTH; depth++) {
+            int x = s_pan_dir_x > 0 ? s_grid_x0 + GRID_COLS + depth - 1
+                                    : s_grid_x0 - depth;
+            for (int row = 0; row < GRID_ROWS; row++) {
+                request_tile_key(s_zoom, x, s_grid_y0 + row);
+            }
+        }
+    } else if (s_pan_dir_y != 0) {
+        for (int depth = 1; depth <= PREFETCH_DEPTH; depth++) {
+            int y = s_pan_dir_y > 0 ? s_grid_y0 + GRID_ROWS + depth - 1
+                                    : s_grid_y0 - depth;
+            for (int col = 0; col < GRID_COLS; col++) {
+                request_tile_key(s_zoom, s_grid_x0 + col, y);
+            }
+        }
+    }
+
+}
+
 static void map_refresh_grid(void)
 {
     if (s_zoom < 0) return;
     map_position_tiles();
 
-    for (int i = 0; i < TILE_COUNT; i++) {
-        map_tile_t *tile = &s_tiles[i];
-        if (tile_in_grid(tile)) continue;
-        if (tile->image != NULL) lv_obj_add_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
+    for (int i = 0; i < GRID_COUNT; i++) {
+        if (s_cells[i].image != NULL) lv_obj_add_flag(s_cells[i].image, LV_OBJ_FLAG_HIDDEN);
     }
 
-    /* Queue the viewport from the centre outward. PNG decode is serial, so a
-     * row-major queue makes the useful centre tiles wait behind the top edge. */
+    /* Queue the edge in the drag direction first. The right edge is the most
+     * noticeable one during a horizontal drag; putting it at the head of the
+     * FIFO prevents the background ring from delaying those visible tiles. */
+    if (s_pan_dir_x != 0) {
+        const int first_col = s_pan_dir_x > 0 ? GRID_COLS - 1 : 0;
+        const int last_col = s_pan_dir_x > 0 ? -1 : GRID_COLS;
+        const int step = s_pan_dir_x > 0 ? -1 : 1;
+        for (int col = first_col; col != last_col; col += step) {
+            for (int row = 0; row < GRID_ROWS; row++) {
+                const int x = s_grid_x0 + col;
+                const int y = s_grid_y0 + row;
+                int slot = tile_find(s_zoom, x, y);
+                if (slot < 0) {
+                    slot = tile_evict_slot();
+                    if (slot >= 0) queue_tile(slot, x, y);
+                }
+            }
+        }
+    } else if (s_pan_dir_y != 0) {
+        const int first_row = s_pan_dir_y > 0 ? GRID_ROWS - 1 : 0;
+        const int last_row = s_pan_dir_y > 0 ? -1 : GRID_ROWS;
+        const int step = s_pan_dir_y > 0 ? -1 : 1;
+        for (int row = first_row; row != last_row; row += step) {
+            for (int col = 0; col < GRID_COLS; col++) {
+                const int x = s_grid_x0 + col;
+                const int y = s_grid_y0 + row;
+                int slot = tile_find(s_zoom, x, y);
+                if (slot < 0) {
+                    slot = tile_evict_slot();
+                    if (slot >= 0) queue_tile(slot, x, y);
+                }
+            }
+        }
+    }
+
+    /* Fill the remaining viewport from the centre outward. */
     const int centre_col = GRID_COLS / 2;
     const int centre_row = GRID_ROWS / 2;
     for (int distance = 0; distance <= GRID_COLS + GRID_ROWS; distance++) {
@@ -729,6 +914,12 @@ static void map_refresh_grid(void)
                 if (abs(col - centre_col) + abs(row - centre_row) != distance) continue;
                 int x = s_grid_x0 + col;
                 int y = s_grid_y0 + row;
+                int cell_index = row * GRID_COLS + col;
+                map_cell_t *cell = &s_cells[cell_index];
+                cell->z = s_zoom;
+                cell->x = x;
+                cell->y = y;
+                lv_obj_set_pos(cell->image, col * TILE_SIZE, row * TILE_SIZE);
                 int slot = tile_find(s_zoom, x, y);
                 if (slot < 0) {
                     slot = tile_evict_slot();
@@ -736,9 +927,9 @@ static void map_refresh_grid(void)
                 }
                 if (slot < 0) continue;
                 map_tile_t *tile = &s_tiles[slot];
-                lv_obj_set_pos(tile->image, col * TILE_SIZE, row * TILE_SIZE);
                 if (tile->valid && !tile->loading) {
-                    lv_obj_clear_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
+                    lv_image_set_src(cell->image, &tile->dsc);
+                    lv_obj_clear_flag(cell->image, LV_OBJ_FLAG_HIDDEN);
                 }
             }
         }
@@ -747,29 +938,6 @@ static void map_refresh_grid(void)
         map_marker_update_position(&s_markers[i]);
     }
     s_refresh_pending = false;
-}
-
-/* Keep one extra column/row ahead of the finger. These requests use spare
- * cache slots and do not touch currently visible image objects. */
-static void map_prefetch_edge(void)
-{
-    if (s_pan_dir_x != 0) {
-        for (int depth = 1; depth <= PREFETCH_DEPTH; depth++) {
-            const int x = s_pan_dir_x > 0 ? s_grid_x0 + GRID_COLS + depth - 1
-                                          : s_grid_x0 - depth;
-            for (int row = 0; row < GRID_ROWS; row++) {
-                request_tile_key(s_zoom, x, s_grid_y0 + row);
-            }
-        }
-    } else if (s_pan_dir_y != 0) {
-        for (int depth = 1; depth <= PREFETCH_DEPTH; depth++) {
-            const int y = s_pan_dir_y > 0 ? s_grid_y0 + GRID_ROWS + depth - 1
-                                          : s_grid_y0 - depth;
-            for (int col = 0; col < GRID_COLS; col++) {
-                request_tile_key(s_zoom, s_grid_x0 + col, y);
-            }
-        }
-    }
 }
 
 static void map_results_timer_cb(lv_timer_t *timer)
@@ -812,11 +980,17 @@ static void map_results_timer_cb(lv_timer_t *timer)
         tile->failed = !result.ok;
         current_budget--;
         if (result.ok) {
-            map_tile_set_source(tile);
+            map_tile_prepare_source(tile);
             if (tile_in_grid(tile)) {
-                lv_obj_clear_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
-            } else {
-                lv_obj_add_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
+                const int col = tile->x - s_grid_x0;
+                const int row = tile->y - s_grid_y0;
+                if (col >= 0 && col < GRID_COLS && row >= 0 && row < GRID_ROWS) {
+                    map_cell_t *cell = &s_cells[row * GRID_COLS + col];
+                    if (cell->z == tile->z && cell->x == tile->x && cell->y == tile->y) {
+                        lv_image_set_src(cell->image, &tile->dsc);
+                        lv_obj_clear_flag(cell->image, LV_OBJ_FLAG_HIDDEN);
+                    }
+                }
             }
             if (s_map_message != NULL) {
                 lv_obj_add_flag(s_map_message, LV_OBJ_FLAG_HIDDEN);
@@ -1077,18 +1251,11 @@ static void map_zoom_to(int new_zoom)
     s_world_y = (s_world_y + focus_y) * scale - focus_y;
     s_zoom = new_zoom;
 
-    /* Advance the request generation. Old queued/in-flight requests remain
-     * marked loading until the worker returns a result. Releasing a slot here
-     * could let a new request overwrite its pixel buffer during old PNG
-     * decoding, which is the source of the zoom-time freeze/corruption. */
+    /* Cancel queued work but retain completed tiles from every zoom level.
+     * Returning to a recent zoom can then reuse PSRAM immediately. */
     s_map_generation++;
-    for (int i = 0; i < TILE_COUNT; i++) {
-        s_tiles[i].valid = false;
-        s_tiles[i].failed = false;
-        s_tiles[i].z = INT32_MIN;
-        if (s_tiles[i].image != NULL) {
-            lv_obj_add_flag(s_tiles[i].image, LV_OBJ_FLAG_HIDDEN);
-        }
+    for (int i = 0; i < GRID_COUNT; i++) {
+        if (s_cells[i].image != NULL) lv_obj_add_flag(s_cells[i].image, LV_OBJ_FLAG_HIDDEN);
     }
     s_refresh_pending = true;
     ESP_LOGI(TAG, "zoom changed: z=%d center=(%.1f,%.1f)",
@@ -1149,6 +1316,9 @@ static void map_pan_event_cb(lv_event_t *event)
         s_pan_last = point;
         map_position_tiles();
         if (old_grid_x0 != s_grid_x0 || old_grid_y0 != s_grid_y0) {
+            /* Requests queued for the previous viewport are now stale. The
+             * worker drops them before touching the SD card. */
+            s_map_generation++;
             s_refresh_pending = true;
             map_refresh_grid();
         }
@@ -1158,7 +1328,7 @@ static void map_pan_event_cb(lv_event_t *event)
         s_pan_active = false;
         /* Keep touch-time work to one parent-position update. Prefetch only
          * after the gesture settles, matching the MUI/map_tiles approach. */
-        map_prefetch_edge();
+        map_prefetch_margin();
         break;
     default:
         break;
@@ -2398,13 +2568,27 @@ static void map_create(lv_obj_t *parent)
         return;
     }
 
+    s_tile_capacity = 0;
     for (int i = 0; i < TILE_COUNT; i++) {
-        s_tiles[i].image = lv_image_create(s_map_layer);
         s_tiles[i].pixels = heap_caps_malloc(TILE_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (s_tiles[i].pixels == NULL) continue;
-        lv_image_set_antialias(s_tiles[i].image, false);
-        lv_obj_add_flag(s_tiles[i].image, LV_OBJ_FLAG_HIDDEN);
+        if (s_tiles[i].pixels == NULL) {
+            ESP_LOGW(TAG, "PSRAM tile slot %d unavailable", i);
+            continue;
+        }
+        s_tile_capacity++;
+        s_tiles[i].z = INT32_MIN;
     }
+
+    for (int i = 0; i < GRID_COUNT; i++) {
+        s_cells[i].image = lv_image_create(s_map_layer);
+        s_cells[i].z = INT32_MIN;
+        lv_image_set_antialias(s_cells[i].image, false);
+        lv_obj_add_flag(s_cells[i].image, LV_OBJ_FLAG_HIDDEN);
+    }
+
+    ESP_LOGI(TAG, "PSRAM tile cache: %u/%u slots, %u KiB",
+             (unsigned)s_tile_capacity, (unsigned)TILE_COUNT,
+             (unsigned)((s_tile_capacity * TILE_BYTES) / 1024U));
 
     scan_levels();
     double center_x = 0.0, center_y = 0.0;
@@ -2413,21 +2597,23 @@ static void map_create(lv_obj_t *parent)
         s_world_x = center_x * TILE_SIZE - MAP_W * 0.5;
         s_world_y = center_y * TILE_SIZE - MAP_H * 0.5;
         lv_label_set_text(s_map_message, "Loading SD map...");
-        ESP_LOGI(TAG, "PNG tiles ready: root=%s levels=%d..%d z=%d center=(%.1f,%.1f)",
+        ESP_LOGI(TAG, "tile tree ready: root=%s levels=%d..%d z=%d center=(%.1f,%.1f)",
                  s_map_root, s_levels[0], s_levels[s_level_count - 1], s_zoom,
                  center_x, center_y);
+        ESP_LOGI(TAG, "tile format: %s", s_raw_tile_tree ?
+                 "PNG + optional RGB565" : "PNG (no raw probes)");
     } else {
         ESP_LOGW(TAG, "no PNG tiles found under %s (need z/x/y.png)", s_map_root);
         lv_label_set_text(s_map_message, "No /sdcard/map/z/x/y.png tiles");
     }
 
-    for (int i = 0; i < TILE_COUNT; i++) {
-        if (s_tiles[i].pixels == NULL) continue;
-        s_tiles[i].z = INT32_MIN;
-    }
     map_loader_start();
     if (s_zoom >= 0) {
         map_refresh_grid();
+        /* Start filling the surrounding ring immediately. Without this the
+         * first stationary frame only has the viewport and its outer edge can
+         * remain blank until the next gesture. */
+        map_prefetch_margin();
         scale_bar_update();
     }
     map_zoom_button_create(parent, "+", 18, true);

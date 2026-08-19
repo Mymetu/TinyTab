@@ -50,7 +50,10 @@ void SD_Init(void)
         .sclk_io_num = BSP_SD_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 16 * 1024,
+        /* Raw RGB565 tiles are 128 KiB. A larger DMA transaction reduces
+         * FatFS/SPI command overhead while staying below the board's stable
+         * transfer size used by the existing SDSPI setup. */
+        .max_transfer_sz = 32 * 1024,
     };
     ret = spi_bus_initialize(host.slot, &bus_config, SPI_DMA_CH_AUTO);
     if (ret != ESP_OK) {
