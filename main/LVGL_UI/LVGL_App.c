@@ -42,6 +42,7 @@
 #define PREFETCH_DEPTH  1
 #define TILE_BYTES      (TILE_SIZE * TILE_SIZE * 2)
 #define LOAD_QUEUE_LEN  TILE_COUNT
+#define RESULT_QUEUE_LEN (LOAD_QUEUE_LEN * 2)
 #define MAP_RESULT_FRAME_MS 16
 #define RAW_MAP_ROOT    "/sdcard"
 
@@ -101,6 +102,7 @@ static QueueHandle_t s_load_queue;
 static QueueHandle_t s_result_queue;
 static map_tile_t s_tiles[TILE_COUNT];
 static volatile uint32_t s_map_generation = 1;
+static uint32_t s_result_drop_logs;
 static lv_obj_t *s_raw_image;
 static lv_image_dsc_t s_raw_dsc;
 static uint8_t *s_raw_pixels;
@@ -118,7 +120,7 @@ static double s_world_x;
 static double s_world_y;
 static int s_grid_x0;
 static int s_grid_y0;
-static bool s_refresh_pending;
+static volatile bool s_refresh_pending;
 static bool s_pan_active;
 static lv_point_t s_pan_last;
 static int s_pan_dir_x;
@@ -296,6 +298,18 @@ static void map_tile_set_source(map_tile_t *tile)
     lv_image_set_src(tile->image, &tile->dsc);
 }
 
+static void map_loader_release_dropped(const tile_request_t *request)
+{
+    if (request == NULL || request->slot >= TILE_COUNT) return;
+    map_tile_t *tile = &s_tiles[request->slot];
+    if (tile->token != request->token) return;
+    tile->loading = false;
+    tile->valid = false;
+    tile->failed = false;
+    tile->z = INT32_MIN;
+    s_refresh_pending = true;
+}
+
 static void map_loader_task(void *arg)
 {
     (void)arg;
@@ -308,7 +322,12 @@ static void map_loader_task(void *arg)
         if (request.generation != s_map_generation) {
             tile_result_t stale = {.slot = request.slot, .token = request.token,
                                     .generation = request.generation, .ok = false};
-            xQueueSend(s_result_queue, &stale, portMAX_DELAY);
+            if (xQueueSend(s_result_queue, &stale, pdMS_TO_TICKS(20)) != pdTRUE) {
+                map_loader_release_dropped(&request);
+                if (s_result_drop_logs++ < 4) {
+                ESP_LOGW(TAG, "tile result queue full while dropping stale work");
+                }
+            }
             continue;
         }
         char path[192];
@@ -325,14 +344,19 @@ static void map_loader_task(void *arg)
             .generation = request.generation,
             .ok = ok,
         };
-        xQueueSend(s_result_queue, &result, portMAX_DELAY);
+        if (xQueueSend(s_result_queue, &result, pdMS_TO_TICKS(20)) != pdTRUE) {
+            map_loader_release_dropped(&request);
+            if (s_result_drop_logs++ < 4) {
+                ESP_LOGW(TAG, "tile result queue full; keeping loader responsive");
+            }
+        }
     }
 }
 
 static void map_loader_start(void)
 {
     s_load_queue = xQueueCreate(LOAD_QUEUE_LEN, sizeof(tile_request_t));
-    s_result_queue = xQueueCreate(LOAD_QUEUE_LEN, sizeof(tile_result_t));
+    s_result_queue = xQueueCreate(RESULT_QUEUE_LEN, sizeof(tile_result_t));
     if (s_load_queue == NULL || s_result_queue == NULL) {
         ESP_LOGE(TAG, "tile queues unavailable");
         return;
@@ -753,7 +777,7 @@ static void map_results_timer_cb(lv_timer_t *timer)
     (void)timer;
     if (s_raw_mode) return;
     tile_result_t result;
-    bool submitted_current = false;
+    unsigned current_budget = 2;
     bool released_stale = false;
     int stale_budget = 16;
     while (s_result_queue != NULL && stale_budget-- > 0 &&
@@ -766,9 +790,10 @@ static void map_results_timer_cb(lv_timer_t *timer)
         const bool stale = !tile->loading || tile->token != result.token ||
                            result.generation != s_map_generation ||
                            tile->z == INT32_MIN;
-        /* Do not consume a second current result in this tick. It remains in
-         * the queue for the next tick, keeping LVGL invalidation bounded. */
-        if (!stale && submitted_current) break;
+        /* Keep a small per-frame budget: two tiles improve initial map fill,
+         * while avoiding the large invalidation burst from the old unbounded
+         * result loop. */
+        if (!stale && current_budget == 0) break;
         (void)xQueueReceive(s_result_queue, &result, 0);
         if (stale) {
             /* Only release the slot if this result still belongs to its
@@ -785,7 +810,7 @@ static void map_results_timer_cb(lv_timer_t *timer)
         tile->loading = false;
         tile->valid = result.ok;
         tile->failed = !result.ok;
-        submitted_current = true;
+        current_budget--;
         if (result.ok) {
             map_tile_set_source(tile);
             if (tile_in_grid(tile)) {
