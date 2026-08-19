@@ -2,6 +2,11 @@
 #include "Display_Driver.h"
 #include "GPS.h"
 #include "SD_MMC.h"
+#include "LVGL_Chinese_Font.h"
+#include "meshcore_control.h"
+#include "meshcore_core.h"
+#include "meshcore_ble.h"
+#include "lvgl.h"
 
 #include "bsp/esp-bsp.h"
 #include "esp_heap_caps.h"
@@ -24,18 +29,20 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 #define STATUS_H        36
 #define SIDE_MENU_W     148
 #define TILE_SIZE       256
 #define MAP_W           (EXAMPLE_LCD_H_RES - SIDE_MENU_W)
 #define MAP_H           (EXAMPLE_LCD_V_RES - STATUS_H)
-#define GRID_COLS       6
-#define GRID_ROWS       5
-#define TILE_COUNT      49
-#define PREFETCH_DEPTH  3
+#define GRID_COLS       5
+#define GRID_ROWS       4
+#define TILE_COUNT      25
+#define PREFETCH_DEPTH  1
 #define TILE_BYTES      (TILE_SIZE * TILE_SIZE * 2)
 #define LOAD_QUEUE_LEN  TILE_COUNT
+#define MAP_RESULT_FRAME_MS 16
 #define RAW_MAP_ROOT    "/sdcard"
 
 static char s_map_root[96] = "/sdcard/map";
@@ -71,6 +78,7 @@ typedef struct {
 typedef struct {
     uint8_t slot;
     uint32_t token;
+    uint32_t generation;
     int z;
     int x;
     int y;
@@ -79,6 +87,7 @@ typedef struct {
 typedef struct {
     uint8_t slot;
     uint32_t token;
+    uint32_t generation;
     bool ok;
 } tile_result_t;
 
@@ -91,6 +100,7 @@ static lv_timer_t *s_map_timer;
 static QueueHandle_t s_load_queue;
 static QueueHandle_t s_result_queue;
 static map_tile_t s_tiles[TILE_COUNT];
+static volatile uint32_t s_map_generation = 1;
 static lv_obj_t *s_raw_image;
 static lv_image_dsc_t s_raw_dsc;
 static uint8_t *s_raw_pixels;
@@ -153,6 +163,14 @@ static lv_obj_t *s_gps_detail_state;
 static lv_obj_t *s_gps_detail_stream;
 static lv_obj_t *s_gps_detail_satellites;
 static lv_obj_t *s_gps_detail_coordinates;
+static lv_obj_t *s_chat_msg_area;
+static lv_obj_t *s_chat_input;
+static lv_obj_t *s_chat_input_bar;
+static lv_obj_t *s_devices_list;
+static meshcore_device_info_t *s_device_snapshot;
+static uint32_t s_devices_generation = UINT32_MAX;
+static uint32_t s_devices_last_render_ms;
+static lv_obj_t *s_meshcore_restart_box;
 
 static void map_zoom_to(int new_zoom);
 static void scale_bar_update(void);
@@ -165,6 +183,15 @@ static void gps_settings_back_cb(lv_event_t *event);
 static void developer_settings_entry_cb(lv_event_t *event);
 static void developer_settings_back_cb(lv_event_t *event);
 static void fps_overlay_switch_cb(lv_event_t *event);
+static void meshcore_switch_cb(lv_event_t *event);
+static void meshcore_restart_now_cb(lv_event_t *event);
+static void meshcore_restart_later_cb(lv_event_t *event);
+static void meshcore_restart_prompt(bool enabled);
+static void chat_send_event_cb(lv_event_t *event);
+static void chat_kb_show_cb(lv_event_t *event);
+static void chat_kb_hide_cb(lv_event_t *event);
+static void chat_meshcore_poll_cb(lv_timer_t *timer);
+static void devices_update_cb(lv_timer_t *timer);
 
 /* LVGL's sysmon overlay is intentionally always visible in this benchmark.
  * It reports FPS, CPU load and render/flush time independently of the map UI. */
@@ -276,6 +303,14 @@ static void map_loader_task(void *arg)
     uint32_t failure_logs = 0;
     for (;;) {
         if (xQueueReceive(s_load_queue, &request, portMAX_DELAY) != pdTRUE) continue;
+        /* A zoom or a fast pan can invalidate queued work. Drop it before
+         * touching the tile buffer so an old decode can never race a new one. */
+        if (request.generation != s_map_generation) {
+            tile_result_t stale = {.slot = request.slot, .token = request.token,
+                                    .generation = request.generation, .ok = false};
+            xQueueSend(s_result_queue, &stale, portMAX_DELAY);
+            continue;
+        }
         char path[192];
         snprintf(path, sizeof(path), "%s/%d/%d/%d.png", s_map_root,
                  request.z, request.x, request.y);
@@ -287,6 +322,7 @@ static void map_loader_task(void *arg)
         tile_result_t result = {
             .slot = request.slot,
             .token = request.token,
+            .generation = request.generation,
             .ok = ok,
         };
         xQueueSend(s_result_queue, &result, portMAX_DELAY);
@@ -597,6 +633,7 @@ static void queue_tile(int slot, int x, int y)
     tile->token++;
     lv_obj_add_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
     tile_request_t request = {.slot = (uint8_t)slot, .token = tile->token,
+                              .generation = s_map_generation,
                               .z = tile->z, .x = tile->x, .y = tile->y};
     if (xQueueSend(s_load_queue, &request, 0) != pdTRUE) {
         tile->loading = false;
@@ -658,20 +695,27 @@ static void map_refresh_grid(void)
         if (tile->image != NULL) lv_obj_add_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
     }
 
-    for (int row = 0; row < GRID_ROWS; row++) {
-        for (int col = 0; col < GRID_COLS; col++) {
-            int x = s_grid_x0 + col;
-            int y = s_grid_y0 + row;
-            int slot = tile_find(s_zoom, x, y);
-            if (slot < 0) {
-                slot = tile_evict_slot();
-                if (slot >= 0) queue_tile(slot, x, y);
-            }
-            if (slot < 0) continue;
-            map_tile_t *tile = &s_tiles[slot];
-            lv_obj_set_pos(tile->image, col * TILE_SIZE, row * TILE_SIZE);
-            if (tile->valid && !tile->loading) {
-                lv_obj_clear_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
+    /* Queue the viewport from the centre outward. PNG decode is serial, so a
+     * row-major queue makes the useful centre tiles wait behind the top edge. */
+    const int centre_col = GRID_COLS / 2;
+    const int centre_row = GRID_ROWS / 2;
+    for (int distance = 0; distance <= GRID_COLS + GRID_ROWS; distance++) {
+        for (int row = 0; row < GRID_ROWS; row++) {
+            for (int col = 0; col < GRID_COLS; col++) {
+                if (abs(col - centre_col) + abs(row - centre_row) != distance) continue;
+                int x = s_grid_x0 + col;
+                int y = s_grid_y0 + row;
+                int slot = tile_find(s_zoom, x, y);
+                if (slot < 0) {
+                    slot = tile_evict_slot();
+                    if (slot >= 0) queue_tile(slot, x, y);
+                }
+                if (slot < 0) continue;
+                map_tile_t *tile = &s_tiles[slot];
+                lv_obj_set_pos(tile->image, col * TILE_SIZE, row * TILE_SIZE);
+                if (tile->valid && !tile->loading) {
+                    lv_obj_clear_flag(tile->image, LV_OBJ_FLAG_HIDDEN);
+                }
             }
         }
     }
@@ -709,14 +753,39 @@ static void map_results_timer_cb(lv_timer_t *timer)
     (void)timer;
     if (s_raw_mode) return;
     tile_result_t result;
-    while (s_result_queue != NULL &&
-           xQueueReceive(s_result_queue, &result, 0) == pdTRUE) {
-        if (result.slot >= TILE_COUNT) continue;
+    bool submitted_current = false;
+    bool released_stale = false;
+    int stale_budget = 16;
+    while (s_result_queue != NULL && stale_budget-- > 0 &&
+           xQueuePeek(s_result_queue, &result, 0) == pdTRUE) {
+        if (result.slot >= TILE_COUNT) {
+            (void)xQueueReceive(s_result_queue, &result, 0);
+            continue;
+        }
         map_tile_t *tile = &s_tiles[result.slot];
-        if (!tile->loading || tile->token != result.token) continue;
+        const bool stale = !tile->loading || tile->token != result.token ||
+                           result.generation != s_map_generation ||
+                           tile->z == INT32_MIN;
+        /* Do not consume a second current result in this tick. It remains in
+         * the queue for the next tick, keeping LVGL invalidation bounded. */
+        if (!stale && submitted_current) break;
+        (void)xQueueReceive(s_result_queue, &result, 0);
+        if (stale) {
+            /* Only release the slot if this result still belongs to its
+             * current request. Never alter a newer request's state. */
+            if (tile->loading && tile->token == result.token) {
+                tile->loading = false;
+                tile->valid = false;
+                tile->failed = false;
+                tile->z = INT32_MIN;
+            }
+            released_stale = true;
+            continue;
+        }
         tile->loading = false;
         tile->valid = result.ok;
         tile->failed = !result.ok;
+        submitted_current = true;
         if (result.ok) {
             map_tile_set_source(tile);
             if (tile_in_grid(tile)) {
@@ -728,9 +797,13 @@ static void map_results_timer_cb(lv_timer_t *timer)
                 lv_obj_add_flag(s_map_message, LV_OBJ_FLAG_HIDDEN);
             }
         }
-        s_refresh_pending = true;
     }
-    if (s_refresh_pending) map_refresh_grid();
+    if (released_stale) {
+        /* Refill slots released by cancelled zoom requests once per tick,
+         * after the stale batch, instead of once per stale tile. */
+        s_refresh_pending = true;
+        map_refresh_grid();
+    }
 }
 
 /* Web Mercator ground resolution at the equator. Keep the same 1/2/5 scale
@@ -979,13 +1052,12 @@ static void map_zoom_to(int new_zoom)
     s_world_y = (s_world_y + focus_y) * scale - focus_y;
     s_zoom = new_zoom;
 
-    /* Drop pending work from the old level. A request already being decoded
-     * is harmless: its token no longer matches and its result is ignored. */
-    if (s_load_queue != NULL) xQueueReset(s_load_queue);
-    if (s_result_queue != NULL) xQueueReset(s_result_queue);
+    /* Advance the request generation. Old queued/in-flight requests remain
+     * marked loading until the worker returns a result. Releasing a slot here
+     * could let a new request overwrite its pixel buffer during old PNG
+     * decoding, which is the source of the zoom-time freeze/corruption. */
+    s_map_generation++;
     for (int i = 0; i < TILE_COUNT; i++) {
-        s_tiles[i].token++;
-        s_tiles[i].loading = false;
         s_tiles[i].valid = false;
         s_tiles[i].failed = false;
         s_tiles[i].z = INT32_MIN;
@@ -1055,12 +1127,13 @@ static void map_pan_event_cb(lv_event_t *event)
             s_refresh_pending = true;
             map_refresh_grid();
         }
-        map_prefetch_edge();
         break;
     case LV_EVENT_RELEASED:
     case LV_EVENT_PRESS_LOST:
         s_pan_active = false;
-        s_refresh_pending = true;
+        /* Keep touch-time work to one parent-position update. Prefetch only
+         * after the gesture settles, matching the MUI/map_tiles approach. */
+        map_prefetch_edge();
         break;
     default:
         break;
@@ -1308,7 +1381,7 @@ static void system_page_create(lv_obj_t *parent)
                         &lv_font_montserrat_20, 0x8A5A16);
     system_label_create(network, "Benchmark build", 18, 92,
                         &lv_font_montserrat_14, 0x344054);
-    system_label_create(network, "MeshCore and ESP-Hosted services are not linked",
+    system_label_create(network, "MeshCore services are controlled from Settings",
                         18, 126, &lv_font_montserrat_12, 0x778292);
 
     lv_obj_t *storage = system_card_create(parent, 440, 238, 412, 226);
@@ -1359,101 +1432,160 @@ static lv_obj_t *ui_card_create(lv_obj_t *parent, lv_coord_t x, lv_coord_t y,
     return card;
 }
 
-static void chat_bubble_create(lv_obj_t *area, const char *text, bool from_local,
-                               const char *timestamp)
+static void chat_page_create(lv_obj_t *parent)
 {
-    lv_obj_t *row = lv_obj_create(area);
+    lv_obj_set_style_pad_all(parent, 0, 0);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
+                       LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
+
+    s_chat_msg_area = lv_obj_create(parent);
+    lv_obj_set_size(s_chat_msg_area, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_opa(s_chat_msg_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(s_chat_msg_area, 0, 0);
+    lv_obj_set_style_pad_all(s_chat_msg_area, 8, 0);
+    lv_obj_set_style_pad_bottom(s_chat_msg_area, 50, 0);
+    lv_obj_set_style_text_font(s_chat_msg_area, &lv_font_utf8_16x16, 0);
+    lv_obj_set_flex_flow(s_chat_msg_area, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_chat_msg_area, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+    lv_obj_set_scroll_dir(s_chat_msg_area, LV_DIR_VER);
+    lv_obj_add_flag(s_chat_msg_area, LV_OBJ_FLAG_SCROLL_MOMENTUM);
+
+    s_chat_input_bar = lv_obj_create(parent);
+    lv_obj_set_width(s_chat_input_bar, LV_PCT(100));
+    lv_obj_set_height(s_chat_input_bar, 50);
+    lv_obj_align(s_chat_input_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_bg_color(s_chat_input_bar, lv_color_hex(0xF5F5F5), 0);
+    lv_obj_set_style_border_width(s_chat_input_bar, 0, 0);
+    lv_obj_set_style_pad_all(s_chat_input_bar, 6, 0);
+    lv_obj_set_style_pad_top(s_chat_input_bar, 5, 0);
+    lv_obj_set_style_pad_bottom(s_chat_input_bar, 5, 0);
+    lv_obj_set_flex_flow(s_chat_input_bar, LV_FLEX_FLOW_ROW);
+    lv_obj_set_flex_align(s_chat_input_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END,
+                          LV_FLEX_ALIGN_CENTER);
+
+    s_chat_input = lv_textarea_create(s_chat_input_bar);
+    lv_textarea_set_one_line(s_chat_input, true);
+    lv_textarea_set_placeholder_text(s_chat_input, "Type a message...");
+    lv_textarea_set_max_length(s_chat_input, 128);
+    lv_obj_set_flex_grow(s_chat_input, 1);
+    lv_obj_set_height(s_chat_input, 40);
+    lv_obj_set_style_radius(s_chat_input, 20, 0);
+    lv_obj_set_style_border_width(s_chat_input, 1, 0);
+    lv_obj_set_style_border_color(s_chat_input, lv_color_hex(0xCCCCCC), 0);
+    lv_obj_set_style_pad_hor(s_chat_input, 12, 0);
+
+    lv_obj_t *send = lv_btn_create(s_chat_input_bar);
+    lv_obj_set_size(send, 64, 40);
+    lv_obj_set_style_radius(send, 20, 0);
+    lv_obj_set_style_bg_color(send, lv_color_hex(0x1E88E5), 0);
+    lv_obj_add_event_cb(send, chat_send_event_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *send_label = lv_label_create(send);
+    lv_label_set_text(send_label, "Send");
+    lv_obj_set_style_text_color(send_label, lv_color_white(), 0);
+    lv_obj_center(send_label);
+
+    lv_obj_t *keyboard = lv_keyboard_create(lv_screen_active());
+    lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(keyboard, s_chat_input);
+    lv_obj_add_event_cb(keyboard, chat_kb_hide_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(keyboard, chat_kb_hide_cb, LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(s_chat_input, chat_kb_show_cb, LV_EVENT_FOCUSED, keyboard);
+    lv_timer_create(chat_meshcore_poll_cb, 100, NULL);
+}
+
+static void chat_format_time(char *out, size_t size, uint32_t timestamp)
+{
+    time_t value = (time_t)timestamp;
+    struct tm local_time;
+    if (localtime_r(&value, &local_time) != NULL) {
+        strftime(out, size, "%Y-%m-%d %H:%M", &local_time);
+    } else {
+        snprintf(out, size, "1970-01-01 00:00");
+    }
+}
+
+static void chat_add_meshcore_message(const meshcore_chat_message_t *message)
+{
+    if (message == NULL || s_chat_msg_area == NULL) return;
+    lv_obj_t *row = lv_obj_create(s_chat_msg_area);
     lv_obj_set_width(row, LV_PCT(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
     lv_obj_set_style_bg_opa(row, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(row, 0, 0);
     lv_obj_set_style_pad_all(row, 0, 0);
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(row, from_local ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
+    lv_obj_set_flex_align(row, message->is_local ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
     lv_obj_t *bubble = lv_obj_create(row);
     lv_obj_set_width(bubble, LV_SIZE_CONTENT);
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_width(bubble, 520, 0);
+    lv_obj_set_style_max_width(bubble, 170, 0);
     lv_obj_set_style_radius(bubble, 10, 0);
-    lv_obj_set_style_pad_all(bubble, 10, 0);
+    lv_obj_set_style_pad_all(bubble, 8, 0);
     lv_obj_set_style_border_width(bubble, 0, 0);
-    lv_obj_set_style_bg_color(bubble, from_local ? lv_color_hex(0x1E88E5)
-                                                 : lv_color_hex(0xECECEC), 0);
+    lv_obj_set_style_bg_color(bubble, message->is_local ? lv_color_hex(0x1E88E5)
+                                                        : lv_color_hex(0xECECEC), 0);
 
-    lv_obj_t *message = lv_label_create(bubble);
-    lv_label_set_text(message, text);
-    lv_label_set_long_mode(message, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(message, 480);
-    lv_obj_set_style_text_font(message, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(message, from_local ? lv_color_white()
-                                                   : lv_color_hex(0x172033), 0);
+    char stamp[24];
+    chat_format_time(stamp, sizeof(stamp), message->timestamp);
 
-    lv_obj_t *time = lv_label_create(bubble);
-    lv_label_set_text(time, timestamp);
-    lv_obj_set_style_text_font(time, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(time, from_local ? lv_color_hex(0xD7ECFF)
-                                                : lv_color_hex(0x667085), 0);
-    lv_obj_set_style_pad_top(time, 5, 0);
+    lv_obj_t *text = lv_label_create(bubble);
+    lv_obj_set_style_text_font(text, &lv_font_utf8_16x16, 0);
+    lv_obj_set_style_text_color(text, message->is_local ? lv_color_white()
+                                                       : lv_color_black(), 0);
+    lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
+    lv_label_set_text(text, message->text);
+
+    lv_obj_t *time_label = lv_label_create(bubble);
+    lv_label_set_text(time_label, stamp);
+    lv_obj_set_style_text_font(time_label, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(time_label, message->is_local ? lv_color_hex(0xD7ECFF)
+                                                              : lv_color_hex(0x667085), 0);
+    lv_obj_set_style_pad_top(time_label, 4, 0);
+    lv_obj_scroll_to_y(s_chat_msg_area, lv_obj_get_scroll_bottom(s_chat_msg_area), LV_ANIM_OFF);
 }
 
-static void chat_page_create(lv_obj_t *parent)
+static void chat_send_event_cb(lv_event_t *event)
 {
-    lv_obj_set_style_pad_all(parent, 0, 0);
-    lv_obj_set_style_bg_color(parent, lv_color_hex(0xF3F5F7), 0);
-    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
+    (void)event;
+    if (s_chat_input == NULL) return;
+    const char *text = lv_textarea_get_text(s_chat_input);
+    if (text == NULL || text[0] == '\0') return;
+    if (meshcore_core_send_public(text) == ESP_OK) {
+        lv_textarea_set_text(s_chat_input, "");
+    }
+}
 
-    lv_obj_t *title = lv_label_create(parent);
-    lv_label_set_text(title, "Chat");
-    lv_obj_set_pos(title, 20, 16);
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x172033), 0);
+static void chat_meshcore_poll_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    meshcore_chat_message_t message;
+    while (meshcore_core_pop_message(&message)) {
+        chat_add_meshcore_message(&message);
+    }
+}
 
-    lv_obj_t *subtitle = lv_label_create(parent);
-    lv_label_set_text(subtitle, "MeshCore messages");
-    lv_obj_set_pos(subtitle, 22, 47);
-    lv_obj_set_style_text_font(subtitle, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(subtitle, lv_color_hex(0x697386), 0);
+static void chat_kb_show_cb(lv_event_t *event)
+{
+    lv_obj_t *keyboard = lv_event_get_user_data(event);
+    if (keyboard == NULL) return;
+    lv_obj_remove_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(keyboard, lv_event_get_target(event));
+    if (s_chat_input_bar != NULL) {
+        lv_obj_align(s_chat_input_bar, LV_ALIGN_BOTTOM_MID, 0,
+                     -lv_obj_get_height(keyboard));
+    }
+}
 
-    lv_obj_t *message_area = lv_obj_create(parent);
-    lv_obj_set_pos(message_area, 18, 76);
-    lv_obj_set_size(message_area, 834, 384);
-    lv_obj_set_style_bg_opa(message_area, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(message_area, 0, 0);
-    lv_obj_set_style_pad_all(message_area, 8, 0);
-    lv_obj_set_style_pad_row(message_area, 10, 0);
-    lv_obj_set_flex_flow(message_area, LV_FLEX_FLOW_COLUMN);
-    lv_obj_set_scroll_dir(message_area, LV_DIR_VER);
-    lv_obj_set_scrollbar_mode(message_area, LV_SCROLLBAR_MODE_AUTO);
-    chat_bubble_create(message_area, "MeshCore chat UI is ready.", false, "System  00:00");
-    chat_bubble_create(message_area, "Messages will appear here.", true, "You  00:00");
-
-    lv_obj_t *input_bar = ui_card_create(parent, 18, 476, 834, 62);
-    lv_obj_set_style_bg_color(input_bar, lv_color_hex(0xF5F5F5), 0);
-    lv_obj_set_style_border_width(input_bar, 0, 0);
-    lv_obj_set_style_pad_all(input_bar, 6, 0);
-    lv_obj_set_flex_flow(input_bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(input_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
-                          LV_FLEX_ALIGN_CENTER);
-
-    lv_obj_t *input = lv_textarea_create(input_bar);
-    lv_textarea_set_one_line(input, true);
-    lv_textarea_set_placeholder_text(input, "Type a message...");
-    lv_textarea_set_max_length(input, 128);
-    lv_obj_set_flex_grow(input, 1);
-    lv_obj_set_height(input, 40);
-    lv_obj_set_style_radius(input, 20, 0);
-    lv_obj_set_style_pad_hor(input, 12, 0);
-
-    lv_obj_t *send = lv_btn_create(input_bar);
-    lv_obj_set_size(send, 74, 40);
-    lv_obj_set_style_radius(send, 20, 0);
-    lv_obj_set_style_bg_color(send, lv_color_hex(0x1E88E5), 0);
-    lv_obj_t *send_label = lv_label_create(send);
-    lv_label_set_text(send_label, "Send");
-    lv_obj_set_style_text_color(send_label, lv_color_white(), 0);
-    lv_obj_center(send_label);
+static void chat_kb_hide_cb(lv_event_t *event)
+{
+    lv_obj_t *keyboard = lv_event_get_target(event);
+    if (keyboard == NULL) return;
+    lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_keyboard_set_textarea(keyboard, NULL);
+    if (s_chat_input_bar != NULL) lv_obj_align(s_chat_input_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
 }
 
 static void settings_row_style(lv_obj_t *row)
@@ -1473,6 +1605,99 @@ static void settings_row_style(lv_obj_t *row)
     lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
     lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
+}
+
+static void bluetooth_switch_cb(lv_event_t *event)
+{
+    lv_obj_t *sw = lv_event_get_target(event);
+    const bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    const esp_err_t err = meshcore_ble_set_enabled(enabled);
+    if (err != ESP_OK) {
+        /* Keep the control synchronized when persistence or transport
+         * shutdown fails. */
+        if (enabled) lv_obj_clear_state(sw, LV_STATE_CHECKED);
+        else lv_obj_add_state(sw, LV_STATE_CHECKED);
+        ESP_LOGW("SETTINGS", "BLE switch failed: %s", esp_err_to_name(err));
+    }
+}
+
+static void meshcore_switch_cb(lv_event_t *event)
+{
+    lv_obj_t *sw = lv_event_get_target(event);
+    const bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    const esp_err_t err = app_meshcore_set_enabled(enabled);
+    if (err != ESP_OK) {
+        if (enabled) lv_obj_clear_state(sw, LV_STATE_CHECKED);
+        else lv_obj_add_state(sw, LV_STATE_CHECKED);
+        ESP_LOGW("SETTINGS", "MeshCore switch failed: %s", esp_err_to_name(err));
+        return;
+    }
+
+    meshcore_restart_prompt(enabled);
+}
+
+static void meshcore_restart_prompt(bool enabled)
+{
+    if (s_meshcore_restart_box != NULL) lv_obj_delete(s_meshcore_restart_box);
+    s_meshcore_restart_box = lv_obj_create(lv_layer_top());
+    lv_obj_set_size(s_meshcore_restart_box, 430, 190);
+    lv_obj_center(s_meshcore_restart_box);
+    lv_obj_set_style_bg_color(s_meshcore_restart_box, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_meshcore_restart_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_meshcore_restart_box, 1, 0);
+    lv_obj_set_style_border_color(s_meshcore_restart_box, lv_color_hex(0xCBD5E1), 0);
+    lv_obj_set_style_radius(s_meshcore_restart_box, 10, 0);
+    lv_obj_set_style_pad_all(s_meshcore_restart_box, 18, 0);
+    lv_obj_remove_flag(s_meshcore_restart_box, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = lv_label_create(s_meshcore_restart_box);
+    lv_label_set_text(title, "Restart required");
+    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(title, lv_color_hex(0x172033), 0);
+    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
+
+    lv_obj_t *detail = lv_label_create(s_meshcore_restart_box);
+    lv_label_set_text(detail, enabled ? "MeshCore is enabled and will start after restart."
+                                      : "MeshCore is disabled and will stop after restart.");
+    lv_obj_set_width(detail, 394);
+    lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
+    lv_obj_set_style_text_color(detail, lv_color_hex(0x667085), 0);
+    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 0, 38);
+
+    lv_obj_t *later = lv_btn_create(s_meshcore_restart_box);
+    lv_obj_set_size(later, 120, 40);
+    lv_obj_align(later, LV_ALIGN_BOTTOM_RIGHT, 132, 0);
+    lv_obj_add_event_cb(later, meshcore_restart_later_cb, LV_EVENT_CLICKED,
+                        s_meshcore_restart_box);
+    lv_obj_t *later_label = lv_label_create(later);
+    lv_label_set_text(later_label, "Later");
+    lv_obj_center(later_label);
+
+    lv_obj_t *restart = lv_btn_create(s_meshcore_restart_box);
+    lv_obj_set_size(restart, 120, 40);
+    lv_obj_set_style_bg_color(restart, lv_color_hex(0x1E88E5), 0);
+    lv_obj_align(restart, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
+    lv_obj_add_event_cb(restart, meshcore_restart_now_cb, LV_EVENT_CLICKED,
+                        s_meshcore_restart_box);
+    lv_obj_t *restart_label = lv_label_create(restart);
+    lv_label_set_text(restart_label, "Restart now");
+    lv_obj_set_style_text_color(restart_label, lv_color_white(), 0);
+    lv_obj_center(restart_label);
+}
+
+static void meshcore_restart_later_cb(lv_event_t *event)
+{
+    lv_obj_t *box = lv_event_get_user_data(event);
+    if (box != NULL) lv_obj_delete(box);
+    if (box == s_meshcore_restart_box) s_meshcore_restart_box = NULL;
+}
+
+static void meshcore_restart_now_cb(lv_event_t *event)
+{
+    lv_obj_t *box = lv_event_get_user_data(event);
+    if (box != NULL) lv_obj_delete(box);
+    s_meshcore_restart_box = NULL;
+    esp_restart();
 }
 
 static lv_obj_t *settings_value_row(lv_obj_t *list, const char *name,
@@ -1510,7 +1735,17 @@ static void settings_switch_row(lv_obj_t *list, const char *name, bool enabled)
     lv_obj_t *sw = lv_switch_create(row);
     lv_obj_set_size(sw, 50, 28);
     lv_obj_add_flag(sw, LV_OBJ_FLAG_SCROLL_CHAIN_VER | LV_OBJ_FLAG_GESTURE_BUBBLE);
-    if (enabled) lv_obj_add_state(sw, LV_STATE_CHECKED);
+    if (strcmp(name, "Bluetooth") == 0) {
+        if (meshcore_ble_is_enabled()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+        lv_obj_add_event_cb(sw, bluetooth_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    } else if (strcmp(name, "MeshCore") == 0) {
+        /* Do not consult MeshCore/BLE NVS here: this master switch is always
+         * off after a reboot and only starts services on explicit user input. */
+        if (app_meshcore_is_enabled()) lv_obj_add_state(sw, LV_STATE_CHECKED);
+        lv_obj_add_event_cb(sw, meshcore_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
+    } else if (enabled) {
+        lv_obj_add_state(sw, LV_STATE_CHECKED);
+    }
 }
 
 static void settings_page_create(lv_obj_t *parent)
@@ -1561,6 +1796,7 @@ static void settings_page_create(lv_obj_t *parent)
     settings_value_row(list, "WiFi", "Manage", true);
     settings_value_row(list, "Time", "1970-01-01", true);
     settings_value_row(list, "LoRa", "MeshCore", true);
+    settings_switch_row(list, "MeshCore", false);
     settings_switch_row(list, "Bluetooth", false);
     settings_switch_row(list, "Auto Connect", true);
     settings_switch_row(list, "Map Cache", true);
@@ -1723,25 +1959,285 @@ static void fps_overlay_switch_cb(lv_event_t *event)
     }
 }
 
-static void placeholder_page_create(lv_obj_t *parent, const char *title,
-                                    const char *detail)
+static const char *device_type_name(uint8_t type)
+{
+    switch (type) {
+    case 1: return "Companion";
+    case 2: return "Repeater";
+    case 3: return "Room server";
+    case 4: return "Sensor";
+    default: return "Mesh node";
+    }
+}
+
+static uint32_t device_name_color(const char *name)
+{
+    static const uint32_t palette[] = {
+        0x2563EB, 0x0F766E, 0x7C3AED, 0xC2410C, 0x047857, 0xBE123C
+    };
+    uint32_t hash = 2166136261u;
+    while (name != NULL && *name != '\0') hash = (hash ^ (uint8_t)*name++) * 16777619u;
+    return palette[hash % (sizeof(palette) / sizeof(palette[0]))];
+}
+
+static void device_snr_text(char *out, size_t size, int16_t quarter_db)
+{
+    const bool negative = quarter_db < 0;
+    const uint16_t magnitude = (uint16_t)(negative ? -quarter_db : quarter_db);
+    const unsigned fraction = (unsigned)((magnitude % 4U) * 25U);
+    if (fraction == 0) snprintf(out, size, "SNR %s%u dB", negative ? "-" : "",
+                                (unsigned)(magnitude / 4U));
+    else snprintf(out, size, "SNR %s%u.%02u dB", negative ? "-" : "",
+                  (unsigned)(magnitude / 4U), fraction);
+}
+
+static uint32_t device_now_epoch(void)
+{
+    const time_t wall_clock = time(NULL);
+    return wall_clock > 0 ? (uint32_t)wall_clock : (uint32_t)(esp_timer_get_time() / 1000000ULL);
+}
+
+static uint32_t device_message_epoch(const meshcore_device_info_t *device)
+{
+    if (device == NULL) return 0;
+    if (device->last_message_epoch != 0) return device->last_message_epoch;
+    return device->last_message_ms / 1000U;
+}
+
+static bool device_message_is_online(const meshcore_device_info_t *device, uint32_t now_epoch)
+{
+    const uint32_t message_epoch = device_message_epoch(device);
+    return device != NULL && device->message_seen && now_epoch >= message_epoch &&
+           now_epoch - message_epoch <= 3U * 60U * 60U;
+}
+
+static void device_format_last_message(char *out, size_t size,
+                                       const meshcore_device_info_t *device,
+                                       uint32_t now_epoch)
+{
+    if (device == NULL || !device->message_seen) {
+        snprintf(out, size, "Offline | Last msg never");
+        return;
+    }
+    const uint32_t message_epoch = device_message_epoch(device);
+    const uint32_t age = now_epoch >= message_epoch ? now_epoch - message_epoch : 0;
+    const char *state = device_message_is_online(device, now_epoch) ? "Online" : "Offline";
+    char when[24] = "1970-01-01 00:00";
+    time_t value = (time_t)message_epoch;
+    struct tm local_time;
+    if (localtime_r(&value, &local_time) != NULL) strftime(when, sizeof(when), "%Y-%m-%d %H:%M", &local_time);
+    if (age < 60U) snprintf(out, size, "%s | %s", state, when);
+    else if (age < 3600U) snprintf(out, size, "%s | %s (%lum ago)", state, when, (unsigned long)(age / 60U));
+    else if (age < 86400U) snprintf(out, size, "%s | %s (%luh ago)", state, when, (unsigned long)(age / 3600U));
+    else snprintf(out, size, "%s | %s (%lud ago)", state, when, (unsigned long)(age / 86400U));
+}
+
+static lv_obj_t *device_create_rabbit_icon(lv_obj_t *parent)
+{
+    const lv_color_t color = lv_color_hex(0x64748B);
+    lv_obj_t *icon = lv_obj_create(parent);
+    lv_obj_set_size(icon, 38, 38);
+    lv_obj_set_style_bg_opa(icon, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(icon, 0, 0);
+    lv_obj_set_style_pad_all(icon, 0, 0);
+    lv_obj_remove_flag(icon, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *left = lv_obj_create(icon);
+    lv_obj_set_size(left, 7, 18); lv_obj_set_pos(left, 9, 1);
+    lv_obj_set_style_radius(left, LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(left, color, 0);
+    lv_obj_set_style_border_width(left, 0, 0);
+    lv_obj_t *right = lv_obj_create(icon);
+    lv_obj_set_size(right, 7, 18); lv_obj_set_pos(right, 22, 1);
+    lv_obj_set_style_radius(right, LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(right, color, 0);
+    lv_obj_set_style_border_width(right, 0, 0);
+    lv_obj_t *head = lv_obj_create(icon);
+    lv_obj_set_size(head, 28, 23); lv_obj_align(head, LV_ALIGN_BOTTOM_MID, 0, 0);
+    lv_obj_set_style_radius(head, LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(head, color, 0);
+    lv_obj_set_style_border_width(head, 0, 0);
+    for (int i = 0; i < 2; ++i) {
+        lv_obj_t *eye = lv_obj_create(head);
+        lv_obj_set_size(eye, 3, 3); lv_obj_set_pos(eye, i ? 17 : 6, 7);
+        lv_obj_set_style_radius(eye, LV_RADIUS_CIRCLE, 0); lv_obj_set_style_bg_color(eye, lv_color_white(), 0);
+        lv_obj_set_style_border_width(eye, 0, 0);
+    }
+    return icon;
+}
+
+static void devices_render(const meshcore_device_info_t *devices, size_t count)
+{
+    if (s_devices_list == NULL) return;
+    lv_obj_clean(s_devices_list);
+    if (count == 0) {
+        lv_obj_t *empty = lv_obj_create(s_devices_list);
+        lv_obj_set_size(empty, LV_PCT(100), 150);
+        lv_obj_set_style_bg_opa(empty, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(empty, 0, 0);
+        lv_obj_remove_flag(empty, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *title = lv_label_create(empty);
+        lv_label_set_text(title, "No MeshCore devices");
+        lv_obj_set_style_text_font(title, &lv_font_montserrat_18, 0);
+        lv_obj_set_style_text_color(title, lv_color_hex(0x334155), 0);
+        lv_obj_align(title, LV_ALIGN_CENTER, 0, -12);
+        lv_obj_t *detail = lv_label_create(empty);
+        lv_label_set_text(detail, "Waiting for real node adverts");
+        lv_obj_set_style_text_color(detail, lv_color_hex(0x94A3B8), 0);
+        lv_obj_align_to(detail, title, LV_ALIGN_OUT_BOTTOM_MID, 0, 8);
+        return;
+    }
+    const uint32_t now_epoch = device_now_epoch();
+    for (size_t i = 0; i < count; ++i) {
+        const meshcore_device_info_t *device = &devices[i];
+        lv_obj_t *row = lv_obj_create(s_devices_list);
+        lv_obj_set_width(row, LV_PCT(100));
+        lv_obj_set_height(row, 84);
+        lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
+                           LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
+        lv_obj_set_style_bg_color(row, lv_color_white(), 0);
+        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
+        lv_obj_set_style_border_side(row, LV_BORDER_SIDE_BOTTOM, 0);
+        lv_obj_set_style_border_width(row, 1, 0);
+        lv_obj_set_style_border_color(row, lv_color_hex(0xE2E8F0), 0);
+        lv_obj_set_style_radius(row, 0, 0);
+        lv_obj_set_style_pad_hor(row, 14, 0);
+        lv_obj_set_style_pad_column(row, 12, 0);
+        lv_obj_set_flex_flow(row, LV_FLEX_FLOW_ROW);
+        lv_obj_set_flex_align(row, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_CENTER,
+                              LV_FLEX_ALIGN_CENTER);
+
+        lv_obj_t *avatar = lv_obj_create(row);
+        lv_obj_set_size(avatar, 48, 48);
+        lv_obj_set_style_radius(avatar, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(avatar, 0, 0);
+        lv_obj_set_style_bg_color(avatar, lv_color_hex(device_name_color(device->name)), 0);
+        lv_obj_remove_flag(avatar, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *initial = lv_label_create(avatar);
+        const char first = (device->name[0] >= 32 && device->name[0] <= 126) ?
+                           device->name[0] : '#';
+        char letter[2] = {first, '\0'};
+        lv_label_set_text(initial, letter);
+        lv_obj_set_style_text_color(initial, lv_color_white(), 0);
+        lv_obj_set_style_text_font(initial, &lv_font_montserrat_18, 0);
+        lv_obj_center(initial);
+
+        lv_obj_t *info = lv_obj_create(row);
+        lv_obj_set_height(info, LV_SIZE_CONTENT);
+        lv_obj_set_flex_grow(info, 1);
+        lv_obj_set_style_bg_opa(info, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(info, 0, 0);
+        lv_obj_set_style_pad_all(info, 0, 0);
+        lv_obj_set_style_pad_row(info, 4, 0);
+        lv_obj_set_flex_flow(info, LV_FLEX_FLOW_COLUMN);
+        lv_obj_remove_flag(info, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_t *name = lv_label_create(info);
+        lv_label_set_text(name, device->name);
+        lv_label_set_long_mode(name, LV_LABEL_LONG_DOT);
+        lv_obj_set_width(name, LV_PCT(100));
+        lv_obj_set_style_text_font(name, &lv_font_montserrat_16, 0);
+        lv_obj_set_style_text_color(name, lv_color_hex(0x0F172A), 0);
+        lv_obj_t *type = lv_label_create(info);
+        lv_label_set_text(type, device_type_name(device->type));
+        lv_obj_set_style_text_font(type, &lv_font_montserrat_12, 0);
+        lv_obj_set_style_text_color(type, lv_color_hex(0x64748B), 0);
+
+        lv_obj_t *metric = lv_obj_create(row);
+        lv_obj_set_size(metric, 230, LV_SIZE_CONTENT);
+        lv_obj_set_style_bg_opa(metric, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_border_width(metric, 0, 0);
+        lv_obj_set_style_pad_all(metric, 0, 0);
+        lv_obj_remove_flag(metric, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_flex_flow(metric, LV_FLEX_FLOW_COLUMN);
+        lv_obj_set_flex_align(metric, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_END);
+        if (device->route_known && device->hop_count == 0 && device->metrics_valid) {
+            lv_obj_t *rssi = lv_label_create(metric);
+            lv_label_set_text_fmt(rssi, "RSSI %d dBm", (int)device->rssi_dbm);
+            lv_obj_set_style_text_font(rssi, &lv_font_montserrat_14, 0);
+            lv_obj_set_style_text_color(rssi, lv_color_hex(0x047857), 0);
+            char snr_text[32]; device_snr_text(snr_text, sizeof(snr_text), device->snr_quarter_db);
+            lv_obj_t *snr = lv_label_create(metric); lv_label_set_text(snr, snr_text);
+            lv_obj_set_style_text_font(snr, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(snr, lv_color_hex(0x64748B), 0);
+            char last[40]; device_format_last_message(last, sizeof(last), device, now_epoch);
+            lv_obj_t *last_label = lv_label_create(metric); lv_label_set_text(last_label, last);
+            lv_obj_set_style_text_font(last_label, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(last_label, device_message_is_online(device, now_epoch)
+                                                  ? lv_color_hex(0x047857) : lv_color_hex(0x94A3B8), 0);
+        } else if (device->route_known) {
+            lv_obj_t *hops = lv_label_create(metric);
+            lv_label_set_text_fmt(hops, "%u %s", (unsigned)device->hop_count,
+                                  device->hop_count == 1 ? "hop" : "hops");
+            lv_obj_set_style_text_font(hops, &lv_font_montserrat_16, 0);
+            lv_obj_set_style_text_color(hops, lv_color_hex(0x2563EB), 0);
+            lv_obj_t *relay = lv_label_create(metric); lv_label_set_text(relay, "Relayed");
+            lv_obj_set_style_text_font(relay, &lv_font_montserrat_12, 0);
+            lv_obj_set_style_text_color(relay, lv_color_hex(0x64748B), 0);
+            char last[40]; device_format_last_message(last, sizeof(last), device, now_epoch);
+            lv_obj_t *last_label = lv_label_create(metric); lv_label_set_text(last_label, last);
+            lv_obj_set_style_text_font(last_label, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(last_label, device_message_is_online(device, now_epoch)
+                                                  ? lv_color_hex(0x047857) : lv_color_hex(0x94A3B8), 0);
+        } else {
+            lv_obj_set_flex_flow(metric, LV_FLEX_FLOW_ROW);
+            lv_obj_set_flex_align(metric, LV_FLEX_ALIGN_END, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+            device_create_rabbit_icon(metric);
+            char last[40]; device_format_last_message(last, sizeof(last), device, now_epoch);
+            lv_obj_t *last_label = lv_label_create(metric); lv_label_set_text(last_label, last);
+            lv_obj_set_style_text_font(last_label, &lv_font_montserrat_10, 0);
+            lv_obj_set_style_text_color(last_label, device_message_is_online(device, now_epoch)
+                                                  ? lv_color_hex(0x047857) : lv_color_hex(0x94A3B8), 0);
+        }
+    }
+}
+
+static void devices_update_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_device_snapshot == NULL || s_devices_list == NULL) return;
+    uint32_t generation = 0;
+    const size_t count = meshcore_core_get_devices(s_device_snapshot,
+                                                   MESHCORE_DEVICE_LIST_MAX,
+                                                   &generation);
+    const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+    if (generation == s_devices_generation &&
+        (uint32_t)(now_ms - s_devices_last_render_ms) < 10000U) return;
+    const lv_coord_t scroll_y = s_devices_generation == UINT32_MAX
+                                    ? 0 : lv_obj_get_scroll_y(s_devices_list);
+    s_devices_generation = generation;
+    devices_render(s_device_snapshot, count);
+    s_devices_last_render_ms = now_ms;
+    if (scroll_y > 0 && count > 0) lv_obj_scroll_to_y(s_devices_list, scroll_y, LV_ANIM_OFF);
+}
+
+static void devices_page_create(lv_obj_t *parent)
 {
     lv_obj_set_style_pad_all(parent, 0, 0);
-    lv_obj_set_style_bg_color(parent, lv_color_hex(0xF3F5F7), 0);
-    lv_obj_set_style_bg_opa(parent, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(parent, 0, 0);
+    lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
+                       LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_set_scroll_dir(parent, LV_DIR_NONE);
+    lv_obj_set_scrollbar_mode(parent, LV_SCROLLBAR_MODE_OFF);
 
-    lv_obj_t *heading = lv_label_create(parent);
-    lv_label_set_text(heading, title);
-    lv_obj_set_pos(heading, 28, 28);
-    lv_obj_set_style_text_font(heading, &lv_font_montserrat_24, 0);
-    lv_obj_set_style_text_color(heading, lv_color_hex(0x25364A), 0);
+    s_devices_list = lv_obj_create(parent);
+    lv_obj_set_size(s_devices_list, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(s_devices_list, lv_color_hex(0xF8FAFC), 0);
+    lv_obj_set_style_bg_opa(s_devices_list, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_devices_list, 0, 0);
+    lv_obj_set_style_pad_all(s_devices_list, 12, 0);
+    lv_obj_set_style_pad_row(s_devices_list, 0, 0);
+    lv_obj_add_flag(s_devices_list, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_MOMENTUM);
+    lv_obj_remove_flag(s_devices_list, LV_OBJ_FLAG_SCROLL_ELASTIC | LV_OBJ_FLAG_SCROLL_CHAIN);
+    lv_obj_set_scroll_dir(s_devices_list, LV_DIR_VER);
+    lv_obj_set_scrollbar_mode(s_devices_list, LV_SCROLLBAR_MODE_AUTO);
+    lv_obj_set_flex_flow(s_devices_list, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(s_devices_list, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
 
-    lv_obj_t *body = lv_label_create(parent);
-    lv_label_set_text(body, detail);
-    lv_obj_set_pos(body, 30, 76);
-    lv_obj_set_style_text_font(body, &lv_font_montserrat_14, 0);
-    lv_obj_set_style_text_color(body, lv_color_hex(0x5B6470), 0);
+    s_device_snapshot = heap_caps_calloc(MESHCORE_DEVICE_LIST_MAX,
+                                         sizeof(meshcore_device_info_t),
+                                         MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_device_snapshot == NULL) {
+        s_device_snapshot = calloc(MESHCORE_DEVICE_LIST_MAX,
+                                   sizeof(meshcore_device_info_t));
+    }
+    devices_update_cb(NULL);
+    lv_timer_create(devices_update_cb, 1000, NULL);
 }
 
 static void map_gps_ui_create(lv_obj_t *parent)
@@ -1871,7 +2367,7 @@ static void map_create(lv_obj_t *parent)
     if (raw_map_load()) {
         lv_obj_add_flag(s_map_message, LV_OBJ_FLAG_HIDDEN);
         map_gps_ui_create(parent);
-        s_map_timer = lv_timer_create(map_results_timer_cb, 30, NULL);
+        s_map_timer = lv_timer_create(map_results_timer_cb, MAP_RESULT_FRAME_MS, NULL);
         lv_timer_create(gps_ui_timer_cb, 500, NULL);
         gps_ui_timer_cb(NULL);
         return;
@@ -1912,7 +2408,7 @@ static void map_create(lv_obj_t *parent)
     map_zoom_button_create(parent, "+", 18, true);
     map_zoom_button_create(parent, "-", 64, false);
     map_gps_ui_create(parent);
-    s_map_timer = lv_timer_create(map_results_timer_cb, 30, NULL);
+    s_map_timer = lv_timer_create(map_results_timer_cb, MAP_RESULT_FRAME_MS, NULL);
     lv_timer_create(gps_ui_timer_cb, 500, NULL);
     gps_ui_timer_cb(NULL);
 }
@@ -1948,8 +2444,8 @@ void Lvgl_App_Init(void)
     lv_obj_set_style_text_color(s_status_info, lv_color_hex(0x374151), 0);
 
     /* Match the backup navigation shell: a fixed left tab bar and five pages.
-     * Non-map pages remain lightweight placeholders because their old
-     * MeshCore services were intentionally removed from this benchmark. */
+     * MeshCore services remain runtime-gated so the map benchmark can run
+     * without their worker tasks until the user enables them in Settings. */
     lv_obj_t *tv = lv_tabview_create(screen);
     s_tabview = tv;
     lv_tabview_set_tab_bar_position(tv, LV_DIR_LEFT);
@@ -2007,7 +2503,7 @@ void Lvgl_App_Init(void)
     lv_obj_remove_flag(sidebar_title, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
 
     chat_page_create(t1);
-    placeholder_page_create(t2, "Devices", "Device services are disabled in this benchmark.");
+    devices_page_create(t2);
     map_create(t3);
     settings_page_create(t4);
     system_page_create(t5);

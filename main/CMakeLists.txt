@@ -4,6 +4,7 @@ idf_component_register(
         "GPS/GPS.c"
         "LCD_Driver/Display_Driver.c"
         "LVGL_UI/LVGL_App.c"
+        "LVGL_UI/LVGL_Chinese_Font.c"
         "SD_Card/SD_MMC.c"
     INCLUDE_DIRS
         "."
@@ -20,6 +21,11 @@ idf_component_register(
         esp_timer
         spi_flash
         fatfs
+        nvs_flash
+        spiffs
         waveshare__esp32_p4_wifi6_touch_lcd_7b
         lvgl__lvgl
+        meshcore_core
+        meshcore_ble
+        meshcore_radio
 )
