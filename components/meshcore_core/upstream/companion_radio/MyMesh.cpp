@@ -816,7 +816,9 @@ void MyMesh::onChannelMessageRecv(const mesh::GroupChannel &channel, mesh::Packe
 
   uint8_t channel_idx = findChannelIdx(channel);
   if (channel_idx == 0) {
-    meshcore_port_on_channel_message(timestamp, text, false);
+    meshcore_port_on_channel_message(timestamp, text, false,
+                                     static_cast<int16_t>(pkt->getSNR() * 4.0f),
+                                     pkt->isRouteFlood() ? pkt->getPathHashCount() : 0);
   }
   out_frame[i++] = channel_idx;
   uint8_t path_len = out_frame[i++] = pkt->isRouteFlood() ? pkt->path_len : 0xFF;

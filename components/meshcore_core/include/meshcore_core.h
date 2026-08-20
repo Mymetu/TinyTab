@@ -15,9 +15,23 @@ extern "C" {
 #define MESHCORE_DEVICE_NAME_MAX_LEN 32
 #define MESHCORE_DEVICE_LIST_MAX 64
 
+typedef enum {
+    MESHCORE_CHAT_RECEIVED = 0,
+    MESHCORE_CHAT_SENDING = 1,
+    MESHCORE_CHAT_BROADCAST = 2,
+    MESHCORE_CHAT_FAILED = 3,
+} meshcore_chat_status_t;
+
 typedef struct {
     bool is_local;
+    bool status_update;
+    bool metrics_valid;
+    meshcore_chat_status_t status;
+    uint32_t message_id;
     uint32_t timestamp;
+    uint8_t router_count;
+    int16_t rssi_dbm;
+    int16_t snr_quarter_db;
     char text[MESHCORE_CHAT_TEXT_MAX_LEN + 1];
 } meshcore_chat_message_t;
 

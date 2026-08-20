@@ -22,10 +22,10 @@ idf_component_register(
         spi_flash
         fatfs
         nvs_flash
+        esp_app_format
         spiffs
         waveshare__esp32_p4_wifi6_touch_lcd_7b
         lvgl__lvgl
         meshcore_core
-        meshcore_ble
         meshcore_radio
 )

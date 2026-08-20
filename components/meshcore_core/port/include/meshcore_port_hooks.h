@@ -4,7 +4,9 @@
 
 extern "C" void meshcore_port_on_channel_message(uint32_t timestamp,
                                                    const char *text,
-                                                   bool is_local);
+                                                   bool is_local,
+                                                   int16_t snr_quarter_db,
+                                                   uint8_t router_count);
 extern "C" void meshcore_port_on_contact_advert(const uint8_t *public_key,
                                                   const char *name,
                                                   uint8_t type,

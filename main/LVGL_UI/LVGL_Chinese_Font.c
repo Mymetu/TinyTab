@@ -32,7 +32,7 @@ static bool utf8_font_get_glyph_dsc(const lv_font_t *font, lv_font_glyph_dsc_t *
     if (glyph_index < 0) return false;
 
     memset(dsc_out, 0, sizeof(*dsc_out));
-    dsc_out->adv_w = utf8_16x16_WIDTH * 16U;
+    dsc_out->adv_w = utf8_16x16_WIDTH;
     dsc_out->box_w = utf8_16x16_WIDTH;
     dsc_out->box_h = utf8_16x16_HEIGHT;
     dsc_out->stride = utf8_16x16_WIDTH;

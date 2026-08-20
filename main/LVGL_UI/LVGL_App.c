@@ -3,9 +3,7 @@
 #include "GPS.h"
 #include "SD_MMC.h"
 #include "LVGL_Chinese_Font.h"
-#include "meshcore_control.h"
 #include "meshcore_core.h"
-#include "meshcore_ble.h"
 #include "lvgl.h"
 
 #include "bsp/esp-bsp.h"
@@ -14,7 +12,9 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_flash.h"
+#include "esp_app_desc.h"
 #include "esp_timer.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/idf_additions.h"
 #include "freertos/queue.h"
@@ -163,6 +163,32 @@ static lv_obj_t *s_scale_label;
 static lv_obj_t *s_settings_home;
 static lv_obj_t *s_developer_settings_page;
 static lv_obj_t *s_fps_overlay_switch;
+static lv_obj_t *s_repeat_forwarding_switch;
+static lv_obj_t *s_repeat_forwarding_status;
+static lv_obj_t *s_device_name_page;
+static lv_obj_t *s_device_name_input;
+static lv_obj_t *s_device_name_value;
+static lv_obj_t *s_device_name_keyboard;
+static lv_obj_t *s_lora_page;
+static lv_obj_t *s_lora_frequency;
+static lv_obj_t *s_lora_bandwidth;
+static lv_obj_t *s_lora_sf;
+static lv_obj_t *s_lora_cr;
+static lv_obj_t *s_lora_power;
+static lv_obj_t *s_lora_rx_gain;
+static lv_obj_t *s_lora_status;
+static lv_obj_t *s_lora_keyboard;
+static lv_obj_t *s_brightness_page;
+static lv_obj_t *s_brightness_value;
+static lv_obj_t *s_brightness_detail_value;
+static lv_obj_t *s_timeout_page;
+static lv_obj_t *s_timeout_value;
+static lv_obj_t *s_timeout_dropdown;
+static lv_obj_t *s_storage_value;
+static uint32_t s_screen_timeout_seconds = 60;
+static bool s_screen_sleeping;
+static uint8_t s_awake_brightness = 70;
+static char s_device_name[33] = "TinyTab";
 static map_marker_t s_markers[MAP_MARKER_MAX];
 static int s_marker_count;
 static int s_gps_marker_first = -1;
@@ -185,11 +211,12 @@ static lv_obj_t *s_gps_detail_coordinates;
 static lv_obj_t *s_chat_msg_area;
 static lv_obj_t *s_chat_input;
 static lv_obj_t *s_chat_input_bar;
+static lv_obj_t *s_chat_pending_status;
+static char s_chat_pending_text[MESHCORE_CHAT_TEXT_MAX_LEN + 1];
 static lv_obj_t *s_devices_list;
 static meshcore_device_info_t *s_device_snapshot;
 static uint32_t s_devices_generation = UINT32_MAX;
 static uint32_t s_devices_last_render_ms;
-static lv_obj_t *s_meshcore_restart_box;
 
 static void map_zoom_to(int new_zoom);
 static void scale_bar_update(void);
@@ -202,10 +229,13 @@ static void gps_settings_back_cb(lv_event_t *event);
 static void developer_settings_entry_cb(lv_event_t *event);
 static void developer_settings_back_cb(lv_event_t *event);
 static void fps_overlay_switch_cb(lv_event_t *event);
-static void meshcore_switch_cb(lv_event_t *event);
-static void meshcore_restart_now_cb(lv_event_t *event);
-static void meshcore_restart_later_cb(lv_event_t *event);
-static void meshcore_restart_prompt(bool enabled);
+static void repeat_forwarding_switch_cb(lv_event_t *event);
+static void device_name_entry_cb(lv_event_t *event);
+static void lora_settings_entry_cb(lv_event_t *event);
+static void brightness_entry_cb(lv_event_t *event);
+static void timeout_entry_cb(lv_event_t *event);
+static void settings_back_cb(lv_event_t *event);
+static void settings_status_timer_cb(lv_timer_t *timer);
 static void chat_send_event_cb(lv_event_t *event);
 static void chat_kb_show_cb(lv_event_t *event);
 static void chat_kb_hide_cb(lv_event_t *event);
@@ -1346,9 +1376,9 @@ static void status_timer_cb(lv_timer_t *timer)
                           (unsigned)((uptime / 3600) % 24),
                           (unsigned)((uptime / 60) % 60),
                           (unsigned)(uptime % 60), (unsigned long)fps);
-    lv_label_set_text_fmt(s_status_info, "z%d  render %lu us  SD %lu MB",
-                          s_zoom, (unsigned long)s_last_render_us,
-                          (unsigned long)SDCard_Size);
+    lv_label_set_text_fmt(s_status_info,
+                          LV_SYMBOL_CHARGE " LoRa %s",
+                          meshcore_core_is_running() ? "OK" : "Starting");
     s_frame_count = 0;
     s_frame_window_start = now;
     if (s_refresh_pending) map_refresh_grid();
@@ -1570,13 +1600,13 @@ static void system_page_create(lv_obj_t *parent)
     s_sys_psram_bar = system_bar_create(psram, 16, 121, 238, 0x7B5CC7);
 
     lv_obj_t *network = system_card_create(parent, 18, 238, 410, 226);
-    system_label_create(network, LV_SYMBOL_WIFI "  NETWORK", 18, 16,
+    system_label_create(network, LV_SYMBOL_CHARGE "  RADIO", 18, 16,
                         &lv_font_montserrat_14, 0x1769AA);
-    system_label_create(network, "WiFi disabled", 18, 50,
+    system_label_create(network, "LoRa radio", 18, 50,
                         &lv_font_montserrat_20, 0x8A5A16);
     system_label_create(network, "Benchmark build", 18, 92,
                         &lv_font_montserrat_14, 0x344054);
-    system_label_create(network, "MeshCore services are controlled from Settings",
+    system_label_create(network, "LoRa + SX1262 start at boot",
                         18, 126, &lv_font_montserrat_12, 0x778292);
 
     lv_obj_t *storage = system_card_create(parent, 440, 238, 412, 226);
@@ -1633,12 +1663,35 @@ static void chat_page_create(lv_obj_t *parent)
     lv_obj_remove_flag(parent, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_SCROLL_ELASTIC |
                        LV_OBJ_FLAG_SCROLL_MOMENTUM | LV_OBJ_FLAG_SCROLL_CHAIN);
 
+    /* Slim header bar */
+    lv_obj_t *header = lv_obj_create(parent);
+    lv_obj_set_size(header, LV_PCT(100), 46);
+    lv_obj_set_style_bg_color(header, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(header, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_side(header, LV_BORDER_SIDE_BOTTOM, 0);
+    lv_obj_set_style_border_width(header, 1, 0);
+    lv_obj_set_style_border_color(header, lv_color_hex(0xE3E8EF), 0);
+    lv_obj_remove_flag(header, LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_t *header_title = lv_label_create(header);
+    lv_label_set_text(header_title, LV_SYMBOL_ENVELOPE "  Mesh Chat");
+    lv_obj_align(header_title, LV_ALIGN_LEFT_MID, 14, 0);
+    lv_obj_set_style_text_font(header_title, &lv_font_montserrat_16, 0);
+    lv_obj_set_style_text_color(header_title, lv_color_hex(0x1F2937), 0);
+    lv_obj_t *header_hint = lv_label_create(header);
+    lv_label_set_text(header_hint, "LoRa mesh");
+    lv_obj_align(header_hint, LV_ALIGN_RIGHT_MID, -14, 0);
+    lv_obj_set_style_text_font(header_hint, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(header_hint, lv_color_hex(0x9AA3AF), 0);
+
     s_chat_msg_area = lv_obj_create(parent);
+    lv_obj_set_pos(s_chat_msg_area, 0, 46);
     lv_obj_set_size(s_chat_msg_area, LV_PCT(100), LV_PCT(100));
-    lv_obj_set_style_bg_opa(s_chat_msg_area, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_bg_color(s_chat_msg_area, lv_color_hex(0xEEF2F7), 0);
+    lv_obj_set_style_bg_opa(s_chat_msg_area, LV_OPA_COVER, 0);
     lv_obj_set_style_border_width(s_chat_msg_area, 0, 0);
-    lv_obj_set_style_pad_all(s_chat_msg_area, 8, 0);
-    lv_obj_set_style_pad_bottom(s_chat_msg_area, 50, 0);
+    lv_obj_set_style_pad_all(s_chat_msg_area, 12, 0);
+    lv_obj_set_style_pad_bottom(s_chat_msg_area, 66, 0);
+    lv_obj_set_style_pad_row(s_chat_msg_area, 10, 0);
     lv_obj_set_style_text_font(s_chat_msg_area, &lv_font_utf8_16x16, 0);
     lv_obj_set_flex_flow(s_chat_msg_area, LV_FLEX_FLOW_COLUMN);
     lv_obj_set_flex_align(s_chat_msg_area, LV_FLEX_ALIGN_START,
@@ -1648,15 +1701,20 @@ static void chat_page_create(lv_obj_t *parent)
 
     s_chat_input_bar = lv_obj_create(parent);
     lv_obj_set_width(s_chat_input_bar, LV_PCT(100));
-    lv_obj_set_height(s_chat_input_bar, 50);
+    lv_obj_set_height(s_chat_input_bar, 58);
     lv_obj_align(s_chat_input_bar, LV_ALIGN_BOTTOM_MID, 0, 0);
-    lv_obj_set_style_bg_color(s_chat_input_bar, lv_color_hex(0xF5F5F5), 0);
-    lv_obj_set_style_border_width(s_chat_input_bar, 0, 0);
-    lv_obj_set_style_pad_all(s_chat_input_bar, 6, 0);
-    lv_obj_set_style_pad_top(s_chat_input_bar, 5, 0);
-    lv_obj_set_style_pad_bottom(s_chat_input_bar, 5, 0);
+    lv_obj_set_style_bg_color(s_chat_input_bar, lv_color_hex(0xFFFFFF), 0);
+    lv_obj_set_style_bg_opa(s_chat_input_bar, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_side(s_chat_input_bar, LV_BORDER_SIDE_TOP, 0);
+    lv_obj_set_style_border_width(s_chat_input_bar, 1, 0);
+    lv_obj_set_style_border_color(s_chat_input_bar, lv_color_hex(0xE3E8EF), 0);
+    lv_obj_set_style_pad_all(s_chat_input_bar, 8, 0);
+    lv_obj_set_style_shadow_width(s_chat_input_bar, 6, 0);
+    lv_obj_set_style_shadow_opa(s_chat_input_bar, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_color(s_chat_input_bar, lv_color_hex(0x334155), 0);
+    lv_obj_set_style_shadow_offset_y(s_chat_input_bar, -2, 0);
     lv_obj_set_flex_flow(s_chat_input_bar, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(s_chat_input_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_END,
+    lv_obj_set_flex_align(s_chat_input_bar, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER,
                           LV_FLEX_ALIGN_CENTER);
 
     s_chat_input = lv_textarea_create(s_chat_input_bar);
@@ -1664,16 +1722,21 @@ static void chat_page_create(lv_obj_t *parent)
     lv_textarea_set_placeholder_text(s_chat_input, "Type a message...");
     lv_textarea_set_max_length(s_chat_input, 128);
     lv_obj_set_flex_grow(s_chat_input, 1);
-    lv_obj_set_height(s_chat_input, 40);
-    lv_obj_set_style_radius(s_chat_input, 20, 0);
-    lv_obj_set_style_border_width(s_chat_input, 1, 0);
-    lv_obj_set_style_border_color(s_chat_input, lv_color_hex(0xCCCCCC), 0);
-    lv_obj_set_style_pad_hor(s_chat_input, 12, 0);
+    lv_obj_set_height(s_chat_input, 42);
+    lv_obj_set_style_radius(s_chat_input, 21, 0);
+    lv_obj_set_style_border_width(s_chat_input, 0, 0);
+    lv_obj_set_style_bg_color(s_chat_input, lv_color_hex(0xF2F4F7), 0);
+    lv_obj_set_style_bg_opa(s_chat_input, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_hor(s_chat_input, 14, 0);
+    lv_obj_set_style_text_color(s_chat_input, lv_color_hex(0x1F2937), 0);
 
     lv_obj_t *send = lv_btn_create(s_chat_input_bar);
-    lv_obj_set_size(send, 64, 40);
-    lv_obj_set_style_radius(send, 20, 0);
+    lv_obj_set_size(send, 42, 42);
+    lv_obj_set_style_radius(send, LV_RADIUS_CIRCLE, 0);
     lv_obj_set_style_bg_color(send, lv_color_hex(0x1E88E5), 0);
+    lv_obj_set_style_shadow_width(send, 4, 0);
+    lv_obj_set_style_shadow_opa(send, LV_OPA_30, 0);
+    lv_obj_set_style_shadow_color(send, lv_color_hex(0x1E88E5), 0);
     lv_obj_add_event_cb(send, chat_send_event_cb, LV_EVENT_CLICKED, NULL);
     lv_obj_t *send_label = lv_label_create(send);
     lv_label_set_text(send_label, "Send");
@@ -1703,6 +1766,22 @@ static void chat_format_time(char *out, size_t size, uint32_t timestamp)
 static void chat_add_meshcore_message(const meshcore_chat_message_t *message)
 {
     if (message == NULL || s_chat_msg_area == NULL) return;
+
+    char stamp[24];
+    chat_format_time(stamp, sizeof(stamp), message->timestamp);
+
+    /* The core reports the completed local broadcast asynchronously. Reuse
+     * the optimistic sending bubble instead of adding a second copy. */
+    if (message->is_local && s_chat_pending_status != NULL &&
+        strcmp(message->text, s_chat_pending_text) == 0) {
+        lv_label_set_text_fmt(s_chat_pending_status, "%s | %s", stamp,
+                              message->status == MESHCORE_CHAT_BROADCAST ?
+                              "broadcast" : "send failed");
+        s_chat_pending_status = NULL;
+        s_chat_pending_text[0] = '\0';
+        return;
+    }
+
     lv_obj_t *row = lv_obj_create(s_chat_msg_area);
     lv_obj_set_width(row, LV_PCT(100));
     lv_obj_set_height(row, LV_SIZE_CONTENT);
@@ -1713,32 +1792,77 @@ static void chat_add_meshcore_message(const meshcore_chat_message_t *message)
     lv_obj_set_flex_align(row, message->is_local ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
                           LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
 
-    lv_obj_t *bubble = lv_obj_create(row);
+    lv_obj_t *message_column = lv_obj_create(row);
+    lv_obj_set_width(message_column, LV_SIZE_CONTENT);
+    lv_obj_set_height(message_column, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(message_column, 520, 0);
+    lv_obj_set_style_bg_opa(message_column, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(message_column, 0, 0);
+    lv_obj_set_style_pad_all(message_column, 0, 0);
+    lv_obj_set_style_pad_row(message_column, 3, 0);
+    lv_obj_set_flex_flow(message_column, LV_FLEX_FLOW_COLUMN);
+    lv_obj_set_flex_align(message_column,
+                          message->is_local ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
+                          message->is_local ? LV_FLEX_ALIGN_END : LV_FLEX_ALIGN_START,
+                          LV_FLEX_ALIGN_START);
+
+    lv_obj_t *bubble = lv_obj_create(message_column);
     lv_obj_set_width(bubble, LV_SIZE_CONTENT);
     lv_obj_set_height(bubble, LV_SIZE_CONTENT);
-    lv_obj_set_style_max_width(bubble, 170, 0);
-    lv_obj_set_style_radius(bubble, 10, 0);
-    lv_obj_set_style_pad_all(bubble, 8, 0);
+    lv_obj_set_style_max_width(bubble, 480, 0);
+    lv_obj_set_style_radius(bubble, 16, 0);
+    lv_obj_set_style_pad_all(bubble, 10, 0);
+    lv_obj_set_style_pad_left(bubble, 13, 0);
+    lv_obj_set_style_pad_right(bubble, 13, 0);
     lv_obj_set_style_border_width(bubble, 0, 0);
-    lv_obj_set_style_bg_color(bubble, message->is_local ? lv_color_hex(0x1E88E5)
-                                                        : lv_color_hex(0xECECEC), 0);
-
-    char stamp[24];
-    chat_format_time(stamp, sizeof(stamp), message->timestamp);
+    lv_obj_set_style_shadow_width(bubble, 5, 0);
+    lv_obj_set_style_shadow_opa(bubble, LV_OPA_20, 0);
+    lv_obj_set_style_shadow_offset_y(bubble, 2, 0);
+    if (message->is_local) {
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(0x1E88E5), 0);
+        lv_obj_set_style_shadow_color(bubble, lv_color_hex(0x1565C0), 0);
+    } else {
+        lv_obj_set_style_bg_color(bubble, lv_color_hex(0xFFFFFF), 0);
+        lv_obj_set_style_border_width(bubble, 1, 0);
+        lv_obj_set_style_border_color(bubble, lv_color_hex(0xE3E8EF), 0);
+        lv_obj_set_style_shadow_color(bubble, lv_color_hex(0x334155), 0);
+    }
 
     lv_obj_t *text = lv_label_create(bubble);
+    lv_obj_set_width(text, LV_SIZE_CONTENT);
+    lv_obj_set_style_max_width(text, 440, 0);
     lv_obj_set_style_text_font(text, &lv_font_utf8_16x16, 0);
     lv_obj_set_style_text_color(text, message->is_local ? lv_color_white()
-                                                       : lv_color_black(), 0);
+                                                       : lv_color_hex(0x1F2937), 0);
     lv_label_set_long_mode(text, LV_LABEL_LONG_WRAP);
     lv_label_set_text(text, message->text);
 
-    lv_obj_t *time_label = lv_label_create(bubble);
-    lv_label_set_text(time_label, stamp);
+    char detail[96];
+    if (message->is_local) {
+        snprintf(detail, sizeof(detail), "%s | %s", stamp,
+                 message->status == MESHCORE_CHAT_BROADCAST ? "broadcast" : "sending");
+    } else if (message->metrics_valid) {
+        snprintf(detail, sizeof(detail), "%s | RSSI %d dBm | SNR %.2f dB",
+                 stamp, (int)message->rssi_dbm,
+                 (double)message->snr_quarter_db / 4.0);
+        if (message->router_count > 0) {
+            size_t used = strlen(detail);
+            snprintf(detail + used, sizeof(detail) - used, " | from %u router%s",
+                     (unsigned)message->router_count,
+                     message->router_count == 1 ? "" : "s");
+        }
+    } else {
+        snprintf(detail, sizeof(detail), "%s | received", stamp);
+    }
+    lv_obj_t *time_label = lv_label_create(message_column);
+    lv_label_set_text(time_label, detail);
     lv_obj_set_style_text_font(time_label, &lv_font_montserrat_10, 0);
-    lv_obj_set_style_text_color(time_label, message->is_local ? lv_color_hex(0xD7ECFF)
-                                                              : lv_color_hex(0x667085), 0);
-    lv_obj_set_style_pad_top(time_label, 4, 0);
+    lv_obj_set_style_text_color(time_label, lv_color_hex(0x8A94A6), 0);
+    lv_obj_set_style_text_opa(time_label, LV_OPA_90, 0);
+    if (message->is_local && message->status == MESHCORE_CHAT_SENDING) {
+        s_chat_pending_status = time_label;
+        strlcpy(s_chat_pending_text, message->text, sizeof(s_chat_pending_text));
+    }
     lv_obj_scroll_to_y(s_chat_msg_area, lv_obj_get_scroll_bottom(s_chat_msg_area), LV_ANIM_OFF);
 }
 
@@ -1749,6 +1873,12 @@ static void chat_send_event_cb(lv_event_t *event)
     const char *text = lv_textarea_get_text(s_chat_input);
     if (text == NULL || text[0] == '\0') return;
     if (meshcore_core_send_public(text) == ESP_OK) {
+        meshcore_chat_message_t pending = {};
+        pending.is_local = true;
+        pending.status = MESHCORE_CHAT_SENDING;
+        pending.timestamp = (uint32_t)time(NULL);
+        strlcpy(pending.text, text, sizeof(pending.text));
+        chat_add_meshcore_message(&pending);
         lv_textarea_set_text(s_chat_input, "");
     }
 }
@@ -1802,97 +1932,404 @@ static void settings_row_style(lv_obj_t *row)
                           LV_FLEX_ALIGN_CENTER);
 }
 
-static void bluetooth_switch_cb(lv_event_t *event)
+#define SETTINGS_NAMESPACE "app_settings"
+#define SETTINGS_DEVICE_NAME "device_name"
+#define SETTINGS_BRIGHTNESS "brightness"
+#define SETTINGS_TIMEOUT "screen_timeout"
+
+static void settings_load(void)
 {
-    lv_obj_t *sw = lv_event_get_target(event);
-    const bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    const esp_err_t err = meshcore_ble_set_enabled(enabled);
-    if (err != ESP_OK) {
-        /* Keep the control synchronized when persistence or transport
-         * shutdown fails. */
-        if (enabled) lv_obj_clear_state(sw, LV_STATE_CHECKED);
-        else lv_obj_add_state(sw, LV_STATE_CHECKED);
-        ESP_LOGW("SETTINGS", "BLE switch failed: %s", esp_err_to_name(err));
+    nvs_handle_t handle;
+    if (nvs_open(SETTINGS_NAMESPACE, NVS_READONLY, &handle) != ESP_OK) return;
+    size_t name_length = sizeof(s_device_name);
+    if (nvs_get_str(handle, SETTINGS_DEVICE_NAME, s_device_name, &name_length) != ESP_OK ||
+        s_device_name[0] == '\0') {
+        strlcpy(s_device_name, "TinyTab", sizeof(s_device_name));
+    }
+    uint32_t brightness = LCD_Backlight;
+    if (nvs_get_u32(handle, SETTINGS_BRIGHTNESS, &brightness) == ESP_OK &&
+        brightness >= 5 && brightness <= 100) {
+        Set_Backlight((uint8_t)brightness);
+    }
+    s_awake_brightness = LCD_Backlight;
+    uint32_t timeout = 60;
+    if (nvs_get_u32(handle, SETTINGS_TIMEOUT, &timeout) == ESP_OK &&
+        (timeout == 0 || timeout == 30 || timeout == 60 ||
+         timeout == 120 || timeout == 300)) {
+        s_screen_timeout_seconds = timeout;
+    }
+    nvs_close(handle);
+}
+
+static esp_err_t settings_save_string(const char *key, const char *value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(handle, key, value);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static esp_err_t settings_save_u32(const char *key, uint32_t value)
+{
+    nvs_handle_t handle = 0;
+    esp_err_t err = nvs_open(SETTINGS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) return err;
+    err = nvs_set_u32(handle, key, value);
+    if (err == ESP_OK) err = nvs_commit(handle);
+    nvs_close(handle);
+    return err;
+}
+
+static lv_obj_t *settings_detail_page_create(lv_obj_t *parent, const char *title)
+{
+    lv_obj_t *page = lv_obj_create(parent);
+    lv_obj_set_size(page, LV_PCT(100), LV_PCT(100));
+    lv_obj_set_style_bg_color(page, lv_color_hex(0xF3F5F7), 0);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(page, 0, 0);
+    lv_obj_set_style_pad_all(page, 0, 0);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+
+    lv_obj_t *back = lv_btn_create(page);
+    lv_obj_set_pos(back, 16, 9);
+    lv_obj_set_size(back, 42, 42);
+    lv_obj_set_style_radius(back, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_bg_color(back, lv_color_hex(0xE5EAF0), 0);
+    lv_obj_set_style_text_color(back, lv_color_hex(0x344054), 0);
+    lv_obj_add_event_cb(back, settings_back_cb, LV_EVENT_CLICKED, page);
+    lv_obj_t *icon = lv_label_create(back);
+    lv_label_set_text(icon, LV_SYMBOL_LEFT);
+    lv_obj_center(icon);
+
+    lv_obj_t *heading = lv_label_create(page);
+    lv_label_set_text(heading, title);
+    lv_obj_set_pos(heading, 72, 12);
+    lv_obj_set_style_text_font(heading, &lv_font_montserrat_20, 0);
+    lv_obj_set_style_text_color(heading, lv_color_hex(0x172033), 0);
+    return page;
+}
+
+static lv_obj_t *settings_card(lv_obj_t *parent, int x, int y, int w, int h)
+{
+    lv_obj_t *card = lv_obj_create(parent);
+    lv_obj_set_pos(card, x, y);
+    lv_obj_set_size(card, w, h);
+    lv_obj_remove_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_style_bg_color(card, lv_color_white(), 0);
+    lv_obj_set_style_border_width(card, 1, 0);
+    lv_obj_set_style_border_color(card, lv_color_hex(0xDDE3EA), 0);
+    lv_obj_set_style_radius(card, 7, 0);
+    return card;
+}
+
+static void settings_show_page(lv_obj_t *page)
+{
+    if (s_settings_home == NULL || page == NULL) return;
+    lv_obj_add_flag(s_settings_home, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_remove_flag(page, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void settings_back_cb(lv_event_t *event)
+{
+    lv_obj_t *page = lv_event_get_user_data(event);
+    if (page != NULL) lv_obj_add_flag(page, LV_OBJ_FLAG_HIDDEN);
+    if (s_settings_home != NULL) lv_obj_remove_flag(s_settings_home, LV_OBJ_FLAG_HIDDEN);
+    if (s_device_name_keyboard != NULL) lv_obj_add_flag(s_device_name_keyboard, LV_OBJ_FLAG_HIDDEN);
+    if (s_lora_keyboard != NULL) lv_obj_add_flag(s_lora_keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void settings_keyboard_show_cb(lv_event_t *event)
+{
+    lv_obj_t *keyboard = lv_event_get_user_data(event);
+    if (keyboard == NULL) return;
+    lv_keyboard_set_textarea(keyboard, lv_event_get_target(event));
+    lv_obj_remove_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void settings_keyboard_hide_cb(lv_event_t *event)
+{
+    lv_obj_t *keyboard = lv_event_get_target(event);
+    lv_keyboard_set_textarea(keyboard, NULL);
+    lv_obj_add_flag(keyboard, LV_OBJ_FLAG_HIDDEN);
+}
+
+static void device_name_save_cb(lv_event_t *event)
+{
+    (void)event;
+    const char *name = lv_textarea_get_text(s_device_name_input);
+    if (name == NULL || name[0] == '\0') return;
+    strlcpy(s_device_name, name, sizeof(s_device_name));
+    if (settings_save_string(SETTINGS_DEVICE_NAME, s_device_name) == ESP_OK) {
+        lv_label_set_text(s_device_name_value, s_device_name);
+        if (s_map_device_name_lbl != NULL) {
+            lv_label_set_text(s_map_device_name_lbl, s_device_name);
+        }
     }
 }
 
-static void meshcore_switch_cb(lv_event_t *event)
+static void device_name_entry_cb(lv_event_t *event)
 {
-    lv_obj_t *sw = lv_event_get_target(event);
-    const bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
-    const esp_err_t err = app_meshcore_set_enabled(enabled);
-    if (err != ESP_OK) {
-        if (enabled) lv_obj_clear_state(sw, LV_STATE_CHECKED);
-        else lv_obj_add_state(sw, LV_STATE_CHECKED);
-        ESP_LOGW("SETTINGS", "MeshCore switch failed: %s", esp_err_to_name(err));
+    (void)event;
+    lv_textarea_set_text(s_device_name_input, s_device_name);
+    settings_show_page(s_device_name_page);
+}
+
+static lv_obj_t *lora_text_field(lv_obj_t *parent, int x, int y,
+                                 const char *label_text, lv_obj_t *keyboard)
+{
+    lv_obj_t *label = lv_label_create(parent);
+    lv_label_set_text(label, label_text);
+    lv_obj_set_pos(label, x, y);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_12, 0);
+    lv_obj_t *field = lv_textarea_create(parent);
+    lv_obj_set_pos(field, x, y + 22);
+    lv_obj_set_size(field, 238, 42);
+    lv_textarea_set_one_line(field, true);
+    lv_textarea_set_accepted_chars(field, "0123456789.-");
+    lv_obj_add_event_cb(field, settings_keyboard_show_cb, LV_EVENT_FOCUSED, keyboard);
+    return field;
+}
+
+static void lora_settings_entry_cb(lv_event_t *event)
+{
+    (void)event;
+    meshcore_lora_config_t cfg = {0};
+    if (meshcore_core_get_lora_config(&cfg) == ESP_OK) {
+        char value[24];
+        snprintf(value, sizeof(value), "%.3f", (double)cfg.frequency_mhz);
+        lv_textarea_set_text(s_lora_frequency, value);
+        snprintf(value, sizeof(value), "%.1f", (double)cfg.bandwidth_khz);
+        lv_textarea_set_text(s_lora_bandwidth, value);
+        snprintf(value, sizeof(value), "%d", cfg.tx_power_dbm);
+        lv_textarea_set_text(s_lora_power, value);
+        lv_dropdown_set_selected(s_lora_sf, cfg.spreading_factor - 5);
+        lv_dropdown_set_selected(s_lora_cr, cfg.coding_rate - 5);
+        if (cfg.rx_boosted_gain) lv_obj_add_state(s_lora_rx_gain, LV_STATE_CHECKED);
+        else lv_obj_clear_state(s_lora_rx_gain, LV_STATE_CHECKED);
+        lv_label_set_text(s_lora_status, "Radio settings loaded");
+    } else {
+        lv_label_set_text(s_lora_status, "Radio is starting");
+    }
+    settings_show_page(s_lora_page);
+}
+
+static void lora_save_cb(lv_event_t *event)
+{
+    (void)event;
+    meshcore_lora_config_t cfg = {0};
+    if (meshcore_core_get_lora_config(&cfg) != ESP_OK) {
+        lv_label_set_text(s_lora_status, "Radio is not ready");
         return;
     }
-
-    meshcore_restart_prompt(enabled);
+    cfg.frequency_mhz = strtof(lv_textarea_get_text(s_lora_frequency), NULL);
+    cfg.bandwidth_khz = strtof(lv_textarea_get_text(s_lora_bandwidth), NULL);
+    cfg.tx_power_dbm = (int8_t)strtol(lv_textarea_get_text(s_lora_power), NULL, 10);
+    cfg.spreading_factor = lv_dropdown_get_selected(s_lora_sf) + 5;
+    cfg.coding_rate = lv_dropdown_get_selected(s_lora_cr) + 5;
+    cfg.rx_boosted_gain = lv_obj_has_state(s_lora_rx_gain, LV_STATE_CHECKED);
+    esp_err_t err = meshcore_core_set_lora_config(&cfg);
+    lv_label_set_text_fmt(s_lora_status,
+                          err == ESP_OK ? "Radio update queued" : "Save failed: %s",
+                          esp_err_to_name(err));
 }
 
-static void meshcore_restart_prompt(bool enabled)
+static void lora_advert_cb(lv_event_t *event)
 {
-    if (s_meshcore_restart_box != NULL) lv_obj_delete(s_meshcore_restart_box);
-    s_meshcore_restart_box = lv_obj_create(lv_layer_top());
-    lv_obj_set_size(s_meshcore_restart_box, 430, 190);
-    lv_obj_center(s_meshcore_restart_box);
-    lv_obj_set_style_bg_color(s_meshcore_restart_box, lv_color_white(), 0);
-    lv_obj_set_style_bg_opa(s_meshcore_restart_box, LV_OPA_COVER, 0);
-    lv_obj_set_style_border_width(s_meshcore_restart_box, 1, 0);
-    lv_obj_set_style_border_color(s_meshcore_restart_box, lv_color_hex(0xCBD5E1), 0);
-    lv_obj_set_style_radius(s_meshcore_restart_box, 10, 0);
-    lv_obj_set_style_pad_all(s_meshcore_restart_box, 18, 0);
-    lv_obj_remove_flag(s_meshcore_restart_box, LV_OBJ_FLAG_SCROLLABLE);
-
-    lv_obj_t *title = lv_label_create(s_meshcore_restart_box);
-    lv_label_set_text(title, "Restart required");
-    lv_obj_set_style_text_font(title, &lv_font_montserrat_20, 0);
-    lv_obj_set_style_text_color(title, lv_color_hex(0x172033), 0);
-    lv_obj_align(title, LV_ALIGN_TOP_LEFT, 0, 0);
-
-    lv_obj_t *detail = lv_label_create(s_meshcore_restart_box);
-    lv_label_set_text(detail, enabled ? "MeshCore is enabled and will start after restart."
-                                      : "MeshCore is disabled and will stop after restart.");
-    lv_obj_set_width(detail, 394);
-    lv_label_set_long_mode(detail, LV_LABEL_LONG_WRAP);
-    lv_obj_set_style_text_color(detail, lv_color_hex(0x667085), 0);
-    lv_obj_align(detail, LV_ALIGN_TOP_LEFT, 0, 38);
-
-    lv_obj_t *later = lv_btn_create(s_meshcore_restart_box);
-    lv_obj_set_size(later, 120, 40);
-    lv_obj_align(later, LV_ALIGN_BOTTOM_RIGHT, 132, 0);
-    lv_obj_add_event_cb(later, meshcore_restart_later_cb, LV_EVENT_CLICKED,
-                        s_meshcore_restart_box);
-    lv_obj_t *later_label = lv_label_create(later);
-    lv_label_set_text(later_label, "Later");
-    lv_obj_center(later_label);
-
-    lv_obj_t *restart = lv_btn_create(s_meshcore_restart_box);
-    lv_obj_set_size(restart, 120, 40);
-    lv_obj_set_style_bg_color(restart, lv_color_hex(0x1E88E5), 0);
-    lv_obj_align(restart, LV_ALIGN_BOTTOM_RIGHT, 0, 0);
-    lv_obj_add_event_cb(restart, meshcore_restart_now_cb, LV_EVENT_CLICKED,
-                        s_meshcore_restart_box);
-    lv_obj_t *restart_label = lv_label_create(restart);
-    lv_label_set_text(restart_label, "Restart now");
-    lv_obj_set_style_text_color(restart_label, lv_color_white(), 0);
-    lv_obj_center(restart_label);
+    bool flood = (bool)(uintptr_t)lv_event_get_user_data(event);
+    esp_err_t err = meshcore_core_send_advert(flood);
+    lv_label_set_text_fmt(s_lora_status,
+                          err == ESP_OK ? "Advert queued" : "Advert failed: %s",
+                          esp_err_to_name(err));
 }
 
-static void meshcore_restart_later_cb(lv_event_t *event)
+static void brightness_slider_cb(lv_event_t *event)
 {
-    lv_obj_t *box = lv_event_get_user_data(event);
-    if (box != NULL) lv_obj_delete(box);
-    if (box == s_meshcore_restart_box) s_meshcore_restart_box = NULL;
+    uint8_t value = (uint8_t)lv_slider_get_value(lv_event_get_target(event));
+    s_awake_brightness = value;
+    Set_Backlight(value);
+    lv_label_set_text_fmt(s_brightness_value, "%u%%", value);
+    lv_label_set_text_fmt(s_brightness_detail_value, "%u%%", value);
+    (void)settings_save_u32(SETTINGS_BRIGHTNESS, value);
 }
 
-static void meshcore_restart_now_cb(lv_event_t *event)
+static void brightness_entry_cb(lv_event_t *event)
 {
-    lv_obj_t *box = lv_event_get_user_data(event);
-    if (box != NULL) lv_obj_delete(box);
-    s_meshcore_restart_box = NULL;
-    esp_restart();
+    (void)event;
+    settings_show_page(s_brightness_page);
+}
+
+static const char *timeout_text(uint32_t seconds)
+{
+    switch (seconds) {
+    case 30: return "30 seconds";
+    case 60: return "60 seconds";
+    case 120: return "2 minutes";
+    case 300: return "5 minutes";
+    default: return "Never";
+    }
+}
+
+static void timeout_changed_cb(lv_event_t *event)
+{
+    static const uint32_t values[] = {30, 60, 120, 300, 0};
+    uint32_t selected = lv_dropdown_get_selected(lv_event_get_target(event));
+    if (selected >= sizeof(values) / sizeof(values[0])) selected = 1;
+    s_screen_timeout_seconds = values[selected];
+    lv_label_set_text(s_timeout_value, timeout_text(s_screen_timeout_seconds));
+    (void)settings_save_u32(SETTINGS_TIMEOUT, s_screen_timeout_seconds);
+    lv_display_trigger_activity(NULL);
+}
+
+static void timeout_entry_cb(lv_event_t *event)
+{
+    (void)event;
+    settings_show_page(s_timeout_page);
+}
+
+static void settings_status_timer_cb(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_storage_value != NULL) {
+        uint64_t total = 0, used = 0;
+        if (SD_Get_Usage(&total, &used)) {
+            lv_label_set_text_fmt(s_storage_value, "%.1f / %.1f GB",
+                                  (double)used / (1024.0 * 1024.0 * 1024.0),
+                                  (double)total / (1024.0 * 1024.0 * 1024.0));
+        } else {
+            lv_label_set_text(s_storage_value, "Not mounted");
+        }
+    }
+
+    uint32_t inactive = lv_display_get_inactive_time(NULL);
+    if (s_screen_timeout_seconds != 0 &&
+        inactive >= s_screen_timeout_seconds * 1000U && !s_screen_sleeping) {
+        s_screen_sleeping = true;
+        s_awake_brightness = LCD_Backlight;
+        Set_Backlight(0);
+    } else if (s_screen_sleeping && inactive < 1000U) {
+        s_screen_sleeping = false;
+        Set_Backlight(s_awake_brightness);
+    }
+}
+
+static void settings_extra_pages_create(lv_obj_t *parent)
+{
+    s_device_name_page = settings_detail_page_create(parent, "Device Name");
+    lv_obj_t *name_card = settings_card(s_device_name_page, 18, 76, 834, 170);
+    lv_obj_t *name_label = lv_label_create(name_card);
+    lv_label_set_text(name_label, "Name");
+    lv_obj_set_pos(name_label, 14, 12);
+    s_device_name_input = lv_textarea_create(name_card);
+    lv_obj_set_pos(s_device_name_input, 14, 42);
+    lv_obj_set_size(s_device_name_input, 610, 48);
+    lv_textarea_set_one_line(s_device_name_input, true);
+    lv_textarea_set_max_length(s_device_name_input, 32);
+    lv_textarea_set_text(s_device_name_input, s_device_name);
+    lv_obj_t *name_save = lv_btn_create(name_card);
+    lv_obj_set_pos(name_save, 642, 42);
+    lv_obj_set_size(name_save, 160, 48);
+    lv_obj_add_event_cb(name_save, device_name_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *name_save_label = lv_label_create(name_save);
+    lv_label_set_text(name_save_label, LV_SYMBOL_SAVE "  Save");
+    lv_obj_center(name_save_label);
+    s_device_name_keyboard = lv_keyboard_create(lv_screen_active());
+    lv_obj_add_flag(s_device_name_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_device_name_keyboard, settings_keyboard_hide_cb,
+                        LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(s_device_name_keyboard, settings_keyboard_hide_cb,
+                        LV_EVENT_CANCEL, NULL);
+    lv_obj_add_event_cb(s_device_name_input, settings_keyboard_show_cb,
+                        LV_EVENT_FOCUSED, s_device_name_keyboard);
+
+    s_lora_page = settings_detail_page_create(parent, "LoRa");
+    lv_obj_t *lora_card = settings_card(s_lora_page, 18, 64, 834, 474);
+    s_lora_keyboard = lv_keyboard_create(lv_screen_active());
+    lv_obj_add_flag(s_lora_keyboard, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_event_cb(s_lora_keyboard, settings_keyboard_hide_cb, LV_EVENT_READY, NULL);
+    lv_obj_add_event_cb(s_lora_keyboard, settings_keyboard_hide_cb, LV_EVENT_CANCEL, NULL);
+    s_lora_frequency = lora_text_field(lora_card, 14, 12, "Frequency (MHz)", s_lora_keyboard);
+    s_lora_bandwidth = lora_text_field(lora_card, 286, 12, "Bandwidth (kHz)", s_lora_keyboard);
+    s_lora_power = lora_text_field(lora_card, 558, 12, "TX power (dBm)", s_lora_keyboard);
+    lv_obj_t *sf_label = lv_label_create(lora_card);
+    lv_label_set_text(sf_label, "Spreading factor");
+    lv_obj_set_pos(sf_label, 14, 100);
+    s_lora_sf = lv_dropdown_create(lora_card);
+    lv_dropdown_set_options(s_lora_sf, "SF5\nSF6\nSF7\nSF8\nSF9\nSF10\nSF11\nSF12");
+    lv_obj_set_pos(s_lora_sf, 14, 124);
+    lv_obj_set_size(s_lora_sf, 238, 42);
+    lv_obj_t *cr_label = lv_label_create(lora_card);
+    lv_label_set_text(cr_label, "Coding rate");
+    lv_obj_set_pos(cr_label, 286, 100);
+    s_lora_cr = lv_dropdown_create(lora_card);
+    lv_dropdown_set_options(s_lora_cr, "CR 4/5\nCR 4/6\nCR 4/7\nCR 4/8");
+    lv_obj_set_pos(s_lora_cr, 286, 124);
+    lv_obj_set_size(s_lora_cr, 238, 42);
+    lv_obj_t *rx_label = lv_label_create(lora_card);
+    lv_label_set_text(rx_label, "RX boosted gain");
+    lv_obj_set_pos(rx_label, 558, 106);
+    s_lora_rx_gain = lv_switch_create(lora_card);
+    lv_obj_set_pos(s_lora_rx_gain, 746, 100);
+    lv_obj_t *save_lora = lv_btn_create(lora_card);
+    lv_obj_set_pos(save_lora, 14, 230);
+    lv_obj_set_size(save_lora, 238, 46);
+    lv_obj_add_event_cb(save_lora, lora_save_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *save_lora_label = lv_label_create(save_lora);
+    lv_label_set_text(save_lora_label, LV_SYMBOL_SAVE "  Save settings");
+    lv_obj_center(save_lora_label);
+    lv_obj_t *zero_advert = lv_btn_create(lora_card);
+    lv_obj_set_pos(zero_advert, 286, 230);
+    lv_obj_set_size(zero_advert, 238, 46);
+    lv_obj_add_event_cb(zero_advert, lora_advert_cb, LV_EVENT_CLICKED, NULL);
+    lv_obj_t *zero_label = lv_label_create(zero_advert);
+    lv_label_set_text(zero_label, "Zero-hop advert");
+    lv_obj_center(zero_label);
+    lv_obj_t *flood_advert = lv_btn_create(lora_card);
+    lv_obj_set_pos(flood_advert, 558, 230);
+    lv_obj_set_size(flood_advert, 238, 46);
+    lv_obj_add_event_cb(flood_advert, lora_advert_cb, LV_EVENT_CLICKED,
+                        (void *)(uintptr_t)1);
+    lv_obj_t *flood_label = lv_label_create(flood_advert);
+    lv_label_set_text(flood_label, "Flood advert");
+    lv_obj_center(flood_label);
+    s_lora_status = lv_label_create(lora_card);
+    lv_label_set_text(s_lora_status, "Radio is starting");
+    lv_obj_set_pos(s_lora_status, 14, 304);
+
+    s_brightness_page = settings_detail_page_create(parent, "Brightness");
+    lv_obj_t *brightness_card = settings_card(s_brightness_page, 18, 76, 834, 170);
+    s_brightness_detail_value = lv_label_create(brightness_card);
+    lv_label_set_text_fmt(s_brightness_detail_value, "%u%%", LCD_Backlight);
+    lv_obj_set_pos(s_brightness_detail_value, 14, 14);
+    lv_obj_set_style_text_font(s_brightness_detail_value, &lv_font_montserrat_24, 0);
+    lv_obj_t *brightness_slider = lv_slider_create(brightness_card);
+    lv_obj_set_pos(brightness_slider, 14, 76);
+    lv_obj_set_size(brightness_slider, 790, 28);
+    lv_slider_set_range(brightness_slider, 5, 100);
+    lv_slider_set_value(brightness_slider, LCD_Backlight, LV_ANIM_OFF);
+    lv_obj_add_event_cb(brightness_slider, brightness_slider_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+
+    s_timeout_page = settings_detail_page_create(parent, "Screen Timeout");
+    lv_obj_t *timeout_card = settings_card(s_timeout_page, 18, 76, 834, 170);
+    lv_obj_t *timeout_label = lv_label_create(timeout_card);
+    lv_label_set_text(timeout_label, "Turn display off after");
+    lv_obj_set_pos(timeout_label, 14, 16);
+    s_timeout_dropdown = lv_dropdown_create(timeout_card);
+    lv_dropdown_set_options(s_timeout_dropdown,
+                            "30 seconds\n60 seconds\n2 minutes\n5 minutes\nNever");
+    lv_obj_set_pos(s_timeout_dropdown, 14, 54);
+    lv_obj_set_size(s_timeout_dropdown, 300, 46);
+    uint32_t timeout_index = s_screen_timeout_seconds == 30 ? 0 :
+                             s_screen_timeout_seconds == 60 ? 1 :
+                             s_screen_timeout_seconds == 120 ? 2 :
+                             s_screen_timeout_seconds == 300 ? 3 : 4;
+    lv_dropdown_set_selected(s_timeout_dropdown, timeout_index);
+    lv_obj_add_event_cb(s_timeout_dropdown, timeout_changed_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
 }
 
 static lv_obj_t *settings_value_row(lv_obj_t *list, const char *name,
@@ -1915,32 +2352,16 @@ static lv_obj_t *settings_value_row(lv_obj_t *list, const char *name,
     }
     if (strcmp(name, "GPS") == 0) {
         lv_obj_add_event_cb(row, gps_settings_entry_cb, LV_EVENT_CLICKED, NULL);
+    } else if (strcmp(name, "Device Name") == 0) {
+        lv_obj_add_event_cb(row, device_name_entry_cb, LV_EVENT_CLICKED, NULL);
+    } else if (strcmp(name, "LoRa") == 0) {
+        lv_obj_add_event_cb(row, lora_settings_entry_cb, LV_EVENT_CLICKED, NULL);
+    } else if (strcmp(name, "Brightness") == 0) {
+        lv_obj_add_event_cb(row, brightness_entry_cb, LV_EVENT_CLICKED, NULL);
+    } else if (strcmp(name, "Screen Timeout") == 0) {
+        lv_obj_add_event_cb(row, timeout_entry_cb, LV_EVENT_CLICKED, NULL);
     }
     return value_label;
-}
-
-static void settings_switch_row(lv_obj_t *list, const char *name, bool enabled)
-{
-    lv_obj_t *row = lv_obj_create(list);
-    settings_row_style(row);
-    lv_obj_t *label = lv_label_create(row);
-    lv_label_set_text(label, name);
-    lv_obj_set_style_text_color(label, lv_color_hex(0x172033), 0);
-    lv_obj_set_flex_grow(label, 1);
-    lv_obj_t *sw = lv_switch_create(row);
-    lv_obj_set_size(sw, 50, 28);
-    lv_obj_add_flag(sw, LV_OBJ_FLAG_SCROLL_CHAIN_VER | LV_OBJ_FLAG_GESTURE_BUBBLE);
-    if (strcmp(name, "Bluetooth") == 0) {
-        if (meshcore_ble_is_enabled()) lv_obj_add_state(sw, LV_STATE_CHECKED);
-        lv_obj_add_event_cb(sw, bluetooth_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    } else if (strcmp(name, "MeshCore") == 0) {
-        /* Do not consult MeshCore/BLE NVS here: this master switch is always
-         * off after a reboot and only starts services on explicit user input. */
-        if (app_meshcore_is_enabled()) lv_obj_add_state(sw, LV_STATE_CHECKED);
-        lv_obj_add_event_cb(sw, meshcore_switch_cb, LV_EVENT_VALUE_CHANGED, NULL);
-    } else if (enabled) {
-        lv_obj_add_state(sw, LV_STATE_CHECKED);
-    }
 }
 
 static void settings_page_create(lv_obj_t *parent)
@@ -1987,21 +2408,17 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
     lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);
 
-    settings_value_row(list, "Device Name", "TinyTab", true);
-    settings_value_row(list, "WiFi", "Manage", true);
-    settings_value_row(list, "Time", "1970-01-01", true);
-    settings_value_row(list, "LoRa", "MeshCore", true);
-    settings_switch_row(list, "MeshCore", false);
-    settings_switch_row(list, "Bluetooth", false);
-    settings_switch_row(list, "Auto Connect", true);
-    settings_switch_row(list, "Map Cache", true);
-    settings_switch_row(list, "Touch Sound", false);
-    settings_value_row(list, "Brightness", "70%", false);
-    settings_value_row(list, "Screen Timeout", "5 min", false);
-    settings_value_row(list, "Theme", "System", true);
-    settings_value_row(list, "Firmware", "v1.2.0", false);
+    s_device_name_value = settings_value_row(list, "Device Name", s_device_name, true);
+    settings_value_row(list, "LoRa", "Radio", true);
+    char brightness_text[12];
+    snprintf(brightness_text, sizeof(brightness_text), "%u%%", LCD_Backlight);
+    s_brightness_value = settings_value_row(list, "Brightness", brightness_text, true);
+    s_timeout_value = settings_value_row(list, "Screen Timeout",
+                                         timeout_text(s_screen_timeout_seconds), true);
+    const esp_app_desc_t *app = esp_app_get_description();
+    settings_value_row(list, "Firmware", app != NULL ? app->version : "1", false);
     s_settings_gps_value = settings_value_row(list, "GPS", "Waiting", true);
-    settings_value_row(list, "Storage", "SD card mounted", false);
+    s_storage_value = settings_value_row(list, "SD Card Storage", "Checking", false);
 
     lv_obj_t *developer = lv_obj_create(list);
     settings_row_style(developer);
@@ -2016,6 +2433,8 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_t *developer_next = lv_label_create(developer);
     lv_label_set_text(developer_next, LV_SYMBOL_RIGHT);
     lv_obj_set_style_text_color(developer_next, lv_color_hex(0x98A2B3), 0);
+
+    settings_extra_pages_create(parent);
 
     s_developer_settings_page = lv_obj_create(parent);
     lv_obj_set_size(s_developer_settings_page, LV_PCT(100), LV_PCT(100));
@@ -2065,6 +2484,30 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_set_style_text_font(fps_detail, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(fps_detail, lv_color_hex(0x697386), 0);
 
+    lv_obj_t *mesh_section = lv_label_create(s_developer_settings_page);
+    lv_label_set_text(mesh_section, "MESH NETWORK");
+    lv_obj_set_pos(mesh_section, 20, 220);
+    lv_obj_set_style_text_font(mesh_section, &lv_font_montserrat_10, 0);
+    lv_obj_set_style_text_color(mesh_section, lv_color_hex(0x778292), 0);
+
+    lv_obj_t *repeat_row = ui_card_create(s_developer_settings_page, 18, 242, 834, 68);
+    lv_obj_t *repeat_label = lv_label_create(repeat_row);
+    lv_label_set_text(repeat_label, "Repeat Forwarding");
+    lv_obj_align(repeat_label, LV_ALIGN_LEFT_MID, 2, 0);
+    lv_obj_set_style_text_font(repeat_label, &lv_font_montserrat_14, 0);
+    lv_obj_set_style_text_color(repeat_label, lv_color_hex(0x172033), 0);
+    s_repeat_forwarding_switch = lv_switch_create(repeat_row);
+    lv_obj_set_size(s_repeat_forwarding_switch, 56, 32);
+    lv_obj_align(s_repeat_forwarding_switch, LV_ALIGN_RIGHT_MID, -2, 0);
+    lv_obj_add_event_cb(s_repeat_forwarding_switch, repeat_forwarding_switch_cb,
+                        LV_EVENT_VALUE_CHANGED, NULL);
+    s_repeat_forwarding_status = lv_label_create(s_developer_settings_page);
+    lv_label_set_text(s_repeat_forwarding_status,
+                      "Allow this device to relay MeshCore packets for other nodes");
+    lv_obj_set_pos(s_repeat_forwarding_status, 20, 326);
+    lv_obj_set_style_text_font(s_repeat_forwarding_status, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_color(s_repeat_forwarding_status, lv_color_hex(0x697386), 0);
+
     s_gps_settings_page = lv_obj_create(parent);
     lv_obj_set_size(s_gps_settings_page, LV_PCT(100), LV_PCT(100));
     lv_obj_set_style_bg_color(s_gps_settings_page, lv_color_hex(0xF3F5F7), 0);
@@ -2109,12 +2552,27 @@ static void settings_page_create(lv_obj_t *parent)
     lv_obj_set_pos(s_gps_detail_coordinates, 20, 236);
     lv_obj_set_style_text_font(s_gps_detail_coordinates, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_gps_detail_coordinates, lv_color_hex(0x172033), 0);
+
+    lv_timer_create(settings_status_timer_cb, 250, NULL);
+    settings_status_timer_cb(NULL);
 }
 
 static void developer_settings_entry_cb(lv_event_t *event)
 {
     (void)event;
     if (s_settings_home == NULL || s_developer_settings_page == NULL) return;
+    meshcore_lora_config_t cfg = {0};
+    if (meshcore_core_get_lora_config(&cfg) == ESP_OK) {
+        if (cfg.client_repeat) {
+            lv_obj_add_state(s_repeat_forwarding_switch, LV_STATE_CHECKED);
+            lv_label_set_text(s_repeat_forwarding_status,
+                              "Enabled: this device relays packets for other nodes");
+        } else {
+            lv_obj_clear_state(s_repeat_forwarding_switch, LV_STATE_CHECKED);
+            lv_label_set_text(s_repeat_forwarding_status,
+                              "Disabled: this device does not relay other nodes' packets");
+        }
+    }
     lv_obj_add_flag(s_settings_home, LV_OBJ_FLAG_HIDDEN);
     lv_obj_remove_flag(s_developer_settings_page, LV_OBJ_FLAG_HIDDEN);
 }
@@ -2152,6 +2610,28 @@ static void fps_overlay_switch_cb(lv_event_t *event)
     } else {
         lv_sysmon_hide_performance(NULL);
     }
+}
+
+static void repeat_forwarding_switch_cb(lv_event_t *event)
+{
+    lv_obj_t *sw = lv_event_get_target(event);
+    bool enabled = lv_obj_has_state(sw, LV_STATE_CHECKED);
+    meshcore_lora_config_t cfg = {0};
+    esp_err_t err = meshcore_core_get_lora_config(&cfg);
+    if (err == ESP_OK) {
+        cfg.client_repeat = enabled ? 1 : 0;
+        err = meshcore_core_set_lora_config(&cfg);
+    }
+    if (err != ESP_OK) {
+        if (enabled) lv_obj_clear_state(sw, LV_STATE_CHECKED);
+        else lv_obj_add_state(sw, LV_STATE_CHECKED);
+        lv_label_set_text_fmt(s_repeat_forwarding_status, "Update failed: %s",
+                              esp_err_to_name(err));
+        return;
+    }
+    lv_label_set_text(s_repeat_forwarding_status,
+                      enabled ? "Enabled: this device relays packets for other nodes"
+                              : "Disabled: this device does not relay other nodes' packets");
 }
 
 static const char *device_type_name(uint8_t type)
@@ -2483,7 +2963,7 @@ static void map_gps_ui_create(lv_obj_t *parent)
                             LV_EVENT_CLICKED, NULL);
 
         s_map_device_name_lbl = lv_label_create(s_map_device_bubble);
-        lv_label_set_text(s_map_device_name_lbl, "TinyTab");
+        lv_label_set_text(s_map_device_name_lbl, s_device_name);
         lv_obj_set_pos(s_map_device_name_lbl, 12, 10);
         lv_obj_set_style_text_font(s_map_device_name_lbl, &lv_font_montserrat_14, 0);
         lv_obj_set_style_text_color(s_map_device_name_lbl, lv_color_hex(0x123B65), 0);
@@ -2626,6 +3106,8 @@ static void map_create(lv_obj_t *parent)
 
 void Lvgl_App_Init(void)
 {
+    settings_load();
+
     lv_obj_t *screen = lv_screen_active();
     lv_obj_set_style_bg_color(screen, lv_color_hex(0xF3F5F7), 0);
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
@@ -2641,7 +3123,7 @@ void Lvgl_App_Init(void)
     lv_obj_set_style_border_color(status, lv_color_hex(0xD7DBE0), 0);
 
     lv_obj_t *title = lv_label_create(status);
-    lv_label_set_text(title, LV_SYMBOL_GPS "  NAVIGATOR");
+    lv_label_set_text(title, LV_SYMBOL_GPS "  TinyTab");
     lv_obj_align(title, LV_ALIGN_LEFT_MID, 12, 0);
     lv_obj_set_style_text_font(title, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(title, lv_color_hex(0x374151), 0);
@@ -2655,8 +3137,7 @@ void Lvgl_App_Init(void)
     lv_obj_set_style_text_color(s_status_info, lv_color_hex(0x374151), 0);
 
     /* Match the backup navigation shell: a fixed left tab bar and five pages.
-     * MeshCore services remain runtime-gated so the map benchmark can run
-     * without their worker tasks until the user enables them in Settings. */
+     * MeshCore core and SX1262 are started by app_main after the UI is ready. */
     lv_obj_t *tv = lv_tabview_create(screen);
     s_tabview = tv;
     lv_tabview_set_tab_bar_position(tv, LV_DIR_LEFT);
@@ -2718,7 +3199,7 @@ void Lvgl_App_Init(void)
     map_create(t3);
     settings_page_create(t4);
     system_page_create(t5);
-    lv_tabview_set_active(tv, 2, LV_ANIM_OFF);
+    lv_tabview_set_active(tv, 1, LV_ANIM_OFF);
 
     lv_display_t *display = lv_display_get_default();
     if (display != NULL) {

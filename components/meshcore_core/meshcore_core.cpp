@@ -38,6 +38,7 @@ constexpr uint32_t kMessageTimeStoreVersion = 1;
 constexpr char kMessageTimeStoreNamespace[] = "mesh_msg_time";
 constexpr char kMessageTimeStoreKey[] = "entries";
 constexpr uint32_t kMeshQueueCaps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+uint32_t s_next_message_id = 1;
 
 struct HeardDeviceRecord {
     uint8_t public_key[PUB_KEY_SIZE];
@@ -428,8 +429,9 @@ void send_public_from_task(const char *text) {
     }
     const uint32_t timestamp = s_rtc_clock.getCurrentTimeUnique();
     const int length = static_cast<int>(std::strlen(text));
+    ++s_next_message_id;
     if(the_mesh.sendGroupMessage(timestamp, channel.channel, the_mesh.getNodeName(), text, length)) {
-        meshcore_port_on_channel_message(timestamp, text, true);
+        meshcore_port_on_channel_message(timestamp, text, true, 0, 0);
     } else {
         ESP_LOGW(kTag, "Public message queue is full");
     }
@@ -506,7 +508,7 @@ void meshcore_task(void *) {
             log_memory("core health");
             next_health_log_us = now_us + 60000000LL;
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
+        vTaskDelay(pdMS_TO_TICKS(300));
     }
 }
 
@@ -655,11 +657,19 @@ void radio_set_tx_power(int8_t dbm) { radio_driver.setTxPower(dbm); }
 mesh::LocalIdentity radio_new_identity() { return mesh::LocalIdentity(&s_identity_rng); }
 
 extern "C" void meshcore_port_on_channel_message(uint32_t timestamp, const char *text,
-                                                   bool is_local) {
+                                                   bool is_local, int16_t snr_quarter_db,
+                                                   uint8_t router_count) {
     if(!s_chat_queue || !text) return;
     meshcore_chat_message_t message = {};
     message.is_local = is_local;
+    message.status_update = false;
+    message.metrics_valid = !is_local;
+    message.status = is_local ? MESHCORE_CHAT_BROADCAST : MESHCORE_CHAT_RECEIVED;
+    message.message_id = is_local ? s_next_message_id - 1 : 0;
     message.timestamp = timestamp;
+    message.router_count = router_count;
+    message.rssi_dbm = static_cast<int16_t>(std::lround(radio_driver.getLastRSSI()));
+    message.snr_quarter_db = snr_quarter_db;
     copy_utf8_truncated(message.text, sizeof(message.text), text);
     if(xQueueSend(s_chat_queue, &message, 0) != pdTRUE) {
         meshcore_chat_message_t discarded;
